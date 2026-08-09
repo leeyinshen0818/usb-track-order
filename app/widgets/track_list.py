@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterable
+from datetime import datetime
 
 from PySide6.QtCore import (
     QAbstractTableModel,
@@ -33,8 +34,16 @@ from app.services.track_ordering import (
     move_up,
     preview_number,
 )
+from app.services.track_sorting import SortDirection
+from app.services.usb_drives import format_bytes
 
 ROWS_MIME_TYPE = "application/x-usb-track-order-rows"
+ORDER_COLUMN = 0
+FILENAME_COLUMN = 1
+MODIFIED_COLUMN = 2
+SIZE_COLUMN = 3
+TYPE_COLUMN = 4
+HEADERS = ("#", "Filename", "Date Modified", "Size", "Type")
 
 
 class TrackTableModel(QAbstractTableModel):
@@ -46,24 +55,34 @@ class TrackTableModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(self.tracks)
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
-        return 0 if parent.isValid() else 2
+        return 0 if parent.isValid() else len(HEADERS)
 
     def data(self, index: QModelIndex, role: int = Qt.DisplayRole):  # type: ignore[override]
         if not index.isValid() or not 0 <= index.row() < len(self.tracks):
             return None
         if role == Qt.DisplayRole:
-            if index.column() == 0:
+            track = self.tracks[index.row()]
+            if index.column() == ORDER_COLUMN:
                 return preview_number(index.row() + 1)
-            return self.tracks[index.row()].original_filename
-        if role == Qt.TextAlignmentRole and index.column() == 0:
+            if index.column() == FILENAME_COLUMN:
+                return track.original_filename
+            if index.column() == MODIFIED_COLUMN:
+                if track.modified_time is None:
+                    return "—"
+                return datetime.fromtimestamp(track.modified_time).strftime("%d/%m/%Y %H:%M")
+            if index.column() == SIZE_COLUMN:
+                return "—" if track.size_bytes is None else format_bytes(track.size_bytes)
+            if index.column() == TYPE_COLUMN:
+                return track.file_type
+        if role == Qt.TextAlignmentRole and index.column() in (ORDER_COLUMN, SIZE_COLUMN):
             return int(Qt.AlignCenter)
-        if role == Qt.ToolTipRole and index.column() == 1:
+        if role == Qt.ToolTipRole and index.column() == FILENAME_COLUMN:
             return str(self.tracks[index.row()].original_path)
         return None
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):  # noqa: N802
         if role == Qt.DisplayRole and orientation == Qt.Horizontal:
-            return ("#", "Filename")[section]
+            return HEADERS[section] if 0 <= section < len(HEADERS) else None
         return super().headerData(section, orientation, role)
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlags:
@@ -80,6 +99,7 @@ class TrackTableModel(QAbstractTableModel):
 
 class TrackTableView(QTableView):
     rows_dropped = Signal(list, int)
+    sort_requested = Signal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -93,8 +113,16 @@ class TrackTableView(QTableView):
         self.setAlternatingRowColors(True)
         self.setSortingEnabled(False)
         self.verticalHeader().setVisible(False)
-        self.horizontalHeader().setStretchLastSection(True)
-        self.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header = self.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(False)
+        header.sectionClicked.connect(self.sort_requested.emit)
+        header.setSectionResizeMode(ORDER_COLUMN, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(FILENAME_COLUMN, QHeaderView.Stretch)
+        header.setSectionResizeMode(MODIFIED_COLUMN, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(SIZE_COLUMN, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(TYPE_COLUMN, QHeaderView.ResizeToContents)
 
     def startDrag(self, supported_actions: Qt.DropActions) -> None:  # noqa: N802
         rows = sorted({index.row() for index in self.selectionModel().selectedRows()})
@@ -142,6 +170,8 @@ class TrackTableView(QTableView):
 
 class TrackListWidget(QWidget):
     selection_changed = Signal()
+    sort_requested = Signal(int)
+    manual_order_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -149,6 +179,7 @@ class TrackListWidget(QWidget):
         self.table = TrackTableView(self)
         self.table.setModel(self.model)
         self.table.rows_dropped.connect(self._drop_rows)
+        self.table.sort_requested.connect(self.sort_requested.emit)
         self.table.selectionModel().selectionChanged.connect(
             lambda _selected, _deselected: self.selection_changed.emit()
         )
@@ -179,6 +210,40 @@ class TrackListWidget(QWidget):
         self.model.replace_tracks(tracks)
         self._select_rows(selected)
 
+    def replace_tracks_preserving_selection(self, tracks: Iterable[Track]) -> None:
+        """Follow selected track paths when their row positions change."""
+
+        selected_paths = {
+            self.model.tracks[row].original_path for row in self.selected_rows()
+        }
+        loaded = list(tracks)
+        self.model.replace_tracks(loaded)
+        self._select_rows(
+            row
+            for row, track in enumerate(loaded)
+            if track.original_path in selected_paths
+        )
+
+    def show_sort_indicator(
+        self, column: int | None, direction: SortDirection | None
+    ) -> None:
+        header = self.table.horizontalHeader()
+        if column is None or direction is None:
+            header.setSortIndicatorShown(False)
+            return
+        order = (
+            Qt.AscendingOrder
+            if direction == SortDirection.ASCENDING
+            else Qt.DescendingOrder
+        )
+        header.setSortIndicator(column, order)
+        header.setSortIndicatorShown(True)
+
+    def set_order_changes_enabled(self, enabled: bool) -> None:
+        self.table.setDragEnabled(enabled)
+        self.table.setAcceptDrops(enabled)
+        self.table.horizontalHeader().setSectionsClickable(enabled)
+
     def selected_rows(self) -> list[int]:
         return sorted(index.row() for index in self.table.selectionModel().selectedRows())
 
@@ -207,8 +272,11 @@ class TrackListWidget(QWidget):
         if not rows:
             return
         tracks, new_rows = operation(self.model.tracks, rows)
+        changed = tracks != self.model.tracks
         self.model.replace_tracks(tracks)
         self._select_rows(new_rows)
+        if changed:
+            self.manual_order_changed.emit()
 
     def move_selected_top(self) -> None:
         self._apply_order(move_top)
@@ -224,5 +292,8 @@ class TrackListWidget(QWidget):
 
     def _drop_rows(self, rows: list[int], insertion_row: int) -> None:
         tracks, new_rows = move_to_insertion(self.model.tracks, rows, insertion_row)
+        changed = tracks != self.model.tracks
         self.model.replace_tracks(tracks)
         self._select_rows(new_rows)
+        if changed:
+            self.manual_order_changed.emit()

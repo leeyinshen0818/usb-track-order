@@ -54,6 +54,17 @@ def test_empty_folder_returns_empty_list(tmp_path: Path) -> None:
     assert scan_folder(tmp_path) == []
 
 
+def test_scanned_track_exposes_file_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "Song.MP3"
+    path.write_bytes(b"audio-data")
+    track = scan_folder(tmp_path)[0]
+    assert track.extension == ".MP3"
+    assert track.file_type == "MP3"
+    assert track.size_bytes == len(b"audio-data")
+    assert track.modified_time is not None
+    assert track.file_identity is not None
+
+
 def test_missing_folder_has_friendly_error(tmp_path: Path) -> None:
     with pytest.raises(FileScanError, match="no longer exists"):
         scan_folder(tmp_path / "missing")
