@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QStandardPaths, QThread, Qt
+from PySide6.QtCore import QSettings, QStandardPaths, QThread, Qt
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -20,6 +21,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app import __version__
+from app.models.track import Track
 from app.services.file_scanner import FileScanError, scan_folder
 from app.services.filename_numbering import (
     build_apply_numbering_plan,
@@ -32,6 +35,18 @@ from app.services.safe_renamer import (
     RenameReceipt,
     RenameValidationError,
     SafeRenamer,
+)
+from app.services.loudness_sync import (
+    DEFAULT_TARGET_LUFS,
+    MAX_TARGET_LUFS,
+    MIN_TARGET_LUFS,
+    LoudnessPlan,
+    LoudnessProgress,
+    LoudnessResult,
+    LoudnessStatus,
+    LoudnessValidationError,
+    build_loudness_plan,
+    validate_target_lufs,
 )
 from app.services.track_sorting import (
     SortField,
@@ -63,6 +78,7 @@ from app.widgets.track_list import (
     TrackListWidget,
 )
 from app.workers.usb_export_worker import UsbExportWorker
+from app.workers.loudness_worker import LoudnessWorker
 
 SORT_COLUMNS = {
     FILENAME_COLUMN: SortField.FILENAME,
@@ -73,9 +89,10 @@ SORT_COLUMNS = {
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
-        self.setWindowTitle("USB Track Order")
+        self.settings = settings or QSettings("USB Track Order", "USB Track Order")
+        self.setWindowTitle(f"USB Track Order v{__version__}")
         self.resize(1020, 760)
         self.setMinimumSize(760, 600)
         self.safe_renamer = SafeRenamer()
@@ -85,6 +102,10 @@ class MainWindow(QMainWindow):
         self.export_thread: QThread | None = None
         self.export_worker: UsbExportWorker | None = None
         self.pending_export_result: ExportResult | None = None
+        self.loudness_running = False
+        self.loudness_thread: QThread | None = None
+        self.loudness_worker: LoudnessWorker | None = None
+        self.pending_loudness_result: LoudnessResult | None = None
         self.usb_destination_path: Path | None = None
         self.usb_destination_drive_id: tuple[str, int | str, int] | None = None
 
@@ -93,7 +114,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(18, 18, 18, 14)
         layout.setSpacing(10)
 
-        heading = QLabel("USB Track Order")
+        heading = QLabel(f"USB Track Order v{__version__}")
         heading.setStyleSheet("font-size: 22px; font-weight: 600;")
         layout.addWidget(heading)
         layout.addWidget(QLabel("Local Folder"))
@@ -117,6 +138,12 @@ class MainWindow(QMainWindow):
         library_status.addWidget(self.sort_label)
         layout.addLayout(library_status)
 
+        library_tools = QHBoxLayout()
+        library_tools.setSpacing(18)
+
+        ordering_tools = QVBoxLayout()
+        ordering_tools.setSpacing(6)
+
         controls = QHBoxLayout()
         self.move_top_button = QPushButton("Move Top")
         self.move_up_button = QPushButton("Move Up")
@@ -130,7 +157,7 @@ class MainWindow(QMainWindow):
         ):
             controls.addWidget(button)
         controls.addStretch()
-        layout.addLayout(controls)
+        ordering_tools.addLayout(controls)
 
         rename_controls = QHBoxLayout()
         self.apply_numbering_button = QPushButton("Apply Numbering")
@@ -140,14 +167,59 @@ class MainWindow(QMainWindow):
         rename_controls.addWidget(self.remove_numbering_button)
         rename_controls.addWidget(self.undo_rename_button)
         rename_controls.addStretch()
-        layout.addLayout(rename_controls)
+        ordering_tools.addLayout(rename_controls)
+        library_tools.addLayout(ordering_tools, 1)
+
+        loudness_tools = QVBoxLayout()
+        loudness_tools.setSpacing(6)
+        loudness_controls = QHBoxLayout()
+        self.target_lufs = QDoubleSpinBox()
+        self.target_lufs.setRange(MIN_TARGET_LUFS, MAX_TARGET_LUFS)
+        self.target_lufs.setDecimals(1)
+        self.target_lufs.setSingleStep(0.5)
+        try:
+            saved_target = validate_target_lufs(
+                self.settings.value("audio/target_lufs", DEFAULT_TARGET_LUFS)
+            )
+        except LoudnessValidationError:
+            saved_target = DEFAULT_TARGET_LUFS
+        self.target_lufs.setValue(saved_target)
+        self.target_lufs.setSuffix(" LUFS")
+        self.synchronize_loudness_button = QPushButton("Synchronize Loudness")
+        self.cancel_loudness_button = QPushButton("Cancel")
+        loudness_controls.addWidget(QLabel("Target Loudness:"))
+        loudness_controls.addWidget(self.target_lufs)
+        loudness_controls.addWidget(self.synchronize_loudness_button)
+        loudness_controls.addWidget(self.cancel_loudness_button)
+        loudness_tools.addLayout(loudness_controls)
+
+        self.loudness_progress = QProgressBar()
+        self.loudness_progress.setRange(0, 100)
+        self.loudness_progress.setValue(0)
+        self.loudness_count_label = QLabel("0 / 0")
+        self.loudness_current_label = QLabel("Current: —")
+        self.loudness_current_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        loudness_progress_row = QHBoxLayout()
+        loudness_progress_row.addWidget(self.loudness_progress, 1)
+        loudness_progress_row.addWidget(self.loudness_count_label)
+        loudness_tools.addLayout(loudness_progress_row)
+        loudness_tools.addWidget(self.loudness_current_label)
+        library_tools.addLayout(loudness_tools, 1)
+
+        layout.addLayout(library_tools)
 
         self.track_list = TrackListWidget()
         layout.addWidget(self.track_list, 1)
 
+        usb_heading_row = QHBoxLayout()
         usb_heading = QLabel("USB Destination")
         usb_heading.setStyleSheet("font-weight: 600;")
-        layout.addWidget(usb_heading)
+        self.usb_capacity_label = QLabel("No removable USB drive detected.")
+        self.usb_capacity_label.setStyleSheet("color: palette(mid);")
+        usb_heading_row.addWidget(usb_heading)
+        usb_heading_row.addStretch()
+        usb_heading_row.addWidget(self.usb_capacity_label)
+        layout.addLayout(usb_heading_row)
 
         usb_row = QHBoxLayout()
         self.usb_combo = QComboBox()
@@ -156,9 +228,6 @@ class MainWindow(QMainWindow):
         usb_row.addWidget(self.usb_combo, 1)
         usb_row.addWidget(self.usb_refresh_button)
         layout.addLayout(usb_row)
-        self.usb_capacity_label = QLabel("No removable USB drive detected.")
-        self.usb_capacity_label.setStyleSheet("color: palette(mid);")
-        layout.addWidget(self.usb_capacity_label)
 
         destination_row = QHBoxLayout()
         self.usb_destination_field = QLineEdit()
@@ -170,23 +239,21 @@ class MainWindow(QMainWindow):
         destination_row.addWidget(self.choose_usb_folder_button)
         layout.addLayout(destination_row)
 
-        export_controls = QHBoxLayout()
+        export_row = QHBoxLayout()
         self.copy_to_usb_button = QPushButton("Copy to USB")
         self.cancel_copy_button = QPushButton("Cancel Copy")
-        export_controls.addWidget(self.copy_to_usb_button)
-        export_controls.addWidget(self.cancel_copy_button)
-        export_controls.addStretch()
-        layout.addLayout(export_controls)
-
         self.export_progress = QProgressBar()
         self.export_progress.setRange(0, 100)
         self.export_progress.setValue(0)
         self.export_count_label = QLabel("0 / 0 tracks")
         self.export_current_label = QLabel("Current: —")
         self.export_current_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        layout.addWidget(self.export_progress)
-        layout.addWidget(self.export_count_label)
-        layout.addWidget(self.export_current_label)
+        export_row.addWidget(self.copy_to_usb_button)
+        export_row.addWidget(self.cancel_copy_button)
+        export_row.addWidget(self.export_progress, 1)
+        export_row.addWidget(self.export_count_label)
+        export_row.addWidget(self.export_current_label)
+        layout.addLayout(export_row)
 
         safety_note = QLabel(
             "Ordering is held in memory. Files are renamed only after confirmation."
@@ -202,6 +269,9 @@ class MainWindow(QMainWindow):
         self.apply_numbering_button.clicked.connect(self.apply_numbering)
         self.remove_numbering_button.clicked.connect(self.remove_numbering)
         self.undo_rename_button.clicked.connect(self.undo_last_rename)
+        self.synchronize_loudness_button.clicked.connect(self.synchronize_loudness)
+        self.cancel_loudness_button.clicked.connect(self.cancel_loudness)
+        self.target_lufs.valueChanged.connect(self._save_target_lufs)
         self.track_list.selection_changed.connect(self._update_controls)
         self.track_list.sort_requested.connect(self.sort_by_column)
         self.track_list.manual_order_changed.connect(self.mark_custom_order)
@@ -212,6 +282,9 @@ class MainWindow(QMainWindow):
         self.cancel_copy_button.clicked.connect(self.cancel_export)
         self.refresh_usb_drives()
         self._update_controls()
+
+    def _save_target_lufs(self, value: float) -> None:
+        self.settings.setValue("audio/target_lufs", float(value))
 
     def open_folder(self) -> None:
         start = self.folder_path.text() or QStandardPaths.writableLocation(
@@ -257,7 +330,7 @@ class MainWindow(QMainWindow):
         already_at_top = rows == list(range(len(rows)))
         bottom_start = track_count - len(rows)
         already_at_bottom = rows == list(range(bottom_start, track_count))
-        available = not self.export_running
+        available = not self.export_running and not self.loudness_running
         self.open_button.setEnabled(available)
         self.move_top_button.setEnabled(available and bool(rows) and not already_at_top)
         self.move_up_button.setEnabled(available and can_move_up)
@@ -282,10 +355,13 @@ class MainWindow(QMainWindow):
             and self.usb_destination_path is not None
         )
         self.cancel_copy_button.setEnabled(self.export_running)
+        self.target_lufs.setEnabled(available)
+        self.synchronize_loudness_button.setEnabled(available and track_count > 0)
+        self.cancel_loudness_button.setEnabled(self.loudness_running)
         self.track_list.set_order_changes_enabled(available)
 
     def sort_by_column(self, column: int) -> None:
-        if self.export_running or column not in SORT_COLUMNS:
+        if self.export_running or self.loudness_running or column not in SORT_COLUMNS:
             return
         self.sort_state = next_sort_state(self.sort_state, SORT_COLUMNS[column])
         assert self.sort_state.field is not None
@@ -301,7 +377,7 @@ class MainWindow(QMainWindow):
         self._update_controls()
 
     def mark_custom_order(self) -> None:
-        if self.export_running:
+        if self.export_running or self.loudness_running:
             return
         self.sort_state = SortState.custom()
         self.sort_label.setText("Sort: Custom Order")
@@ -441,8 +517,164 @@ class MainWindow(QMainWindow):
         self.last_rename = receipt
         self._update_controls()
 
+    def synchronize_loudness(self) -> None:
+        if self.export_running or self.loudness_running:
+            return
+        selected_rows = self.track_list.selected_rows()
+        try:
+            plan = build_loudness_plan(
+                self.track_list.tracks,
+                selected_rows,
+                self.target_lufs.value(),
+            )
+        except LoudnessValidationError as exc:
+            QMessageBox.warning(self, "Cannot Synchronize Loudness", str(exc))
+            return
+
+        scope = "selected" if selected_rows else "loaded"
+        answer = QMessageBox.question(
+            self,
+            "Synchronize Loudness",
+            f"Check {plan.selected_count} {scope} track(s) at "
+            f"{plan.target_lufs:.1f} LUFS?\n\n"
+            f"To process: {len(plan.tracks)}\n"
+            f"Already synchronized: {plan.skipped_count}\n\n"
+            "Each processed original is replaced only after FFmpeg safely creates "
+            "its temporary output. Filenames and list order will not change.",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._start_loudness_sync(plan)
+
+    def _start_loudness_sync(self, plan: LoudnessPlan) -> None:
+        self.loudness_running = True
+        self.pending_loudness_result = None
+        self.loudness_progress.setValue(0)
+        self.loudness_count_label.setText(
+            f"Done 0 | Skip {plan.skipped_count} | Fail 0 | "
+            f"Left {len(plan.tracks)}"
+        )
+        self.loudness_current_label.setText("Current: Preparing…")
+
+        thread = QThread(self)
+        worker = LoudnessWorker(plan)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._loudness_progressed)
+        worker.finished.connect(self._loudness_result_ready)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._loudness_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        self.loudness_thread = thread
+        self.loudness_worker = worker
+        self._update_controls()
+        thread.start()
+
+    def cancel_loudness(self) -> None:
+        if self.loudness_worker is None or not self.loudness_running:
+            return
+        self.loudness_worker.request_cancel()
+        self.cancel_loudness_button.setEnabled(False)
+        self.statusBar().showMessage(
+            "Cancellation requested. The original file will remain safe.", 10000
+        )
+
+    def _loudness_progressed(self, update: LoudnessProgress) -> None:
+        accounted = (
+            update.completed_count + update.skipped_count + update.failed_count
+        )
+        percent = (
+            int(accounted * 100 / update.total_count)
+            if update.total_count
+            else 100
+        )
+        self.loudness_progress.setValue(min(100, percent))
+        remaining = max(0, update.total_count - accounted)
+        self.loudness_count_label.setText(
+            f"Done {update.completed_count} | Skip {update.skipped_count} | "
+            f"Fail {update.failed_count} | Left {remaining}"
+        )
+        self.loudness_current_label.setText(f"Current: {update.current_filename}")
+
+    def _loudness_result_ready(self, result: LoudnessResult) -> None:
+        self.pending_loudness_result = result
+
+    def _loudness_thread_finished(self) -> None:
+        result = self.pending_loudness_result
+        self.loudness_running = False
+        self.loudness_worker = None
+        self.loudness_thread = None
+
+        refreshed = []
+        for track in self.track_list.tracks:
+            refreshed.append(
+                Track.from_path(track.original_path)
+                if track.original_path.exists()
+                else track
+            )
+        self.track_list.refresh_tracks(refreshed)
+        self._update_controls()
+        if result is not None:
+            self._show_loudness_result(result)
+
+    def _show_loudness_result(self, result: LoudnessResult) -> None:
+        if result.status == LoudnessStatus.COMPLETED:
+            self.loudness_progress.setValue(100)
+            self.loudness_count_label.setText(
+                f"Done {result.completed_count} | Skip {result.skipped_count} | "
+                "Fail 0 | Left 0"
+            )
+            self.loudness_current_label.setText("Current: Complete")
+            self.statusBar().showMessage(
+                f"Loudness complete: {result.completed_count} processed, "
+                f"{result.skipped_count} skipped.",
+                15000,
+            )
+            return
+        if result.status == LoudnessStatus.CANCELLED:
+            self.loudness_current_label.setText("Current: Cancelled")
+            remaining = max(
+                0,
+                result.total_count
+                - result.completed_count
+                - result.skipped_count
+                - result.failed_count,
+            )
+            QMessageBox.information(
+                self,
+                "Loudness Synchronization Cancelled",
+                f"Processed: {result.completed_count}\n"
+                f"Skipped: {result.skipped_count}\n"
+                f"Failed: {result.failed_count}\n"
+                f"Remaining: {remaining}\n\n"
+                "Completed tracks remain normalized; the interrupted original is untouched.",
+            )
+            return
+        self.loudness_current_label.setText("Current: Failed")
+        remaining = max(
+            0,
+            result.total_count
+            - result.completed_count
+            - result.skipped_count
+            - result.failed_count,
+        )
+        QMessageBox.critical(
+            self,
+            "Loudness Synchronization Failed",
+            f"Processed: {result.completed_count}\n"
+            f"Skipped: {result.skipped_count}\n"
+            f"Failed: {result.failed_count}\n"
+            f"Remaining: {remaining}\n\n"
+            f"Failed file: {result.failed_filename or 'Unknown'}\n\n"
+            f"Reason: {result.reason or 'Unknown FFmpeg error'}\n\n"
+            "The failed file's original was not changed.",
+        )
+
     def refresh_usb_drives(self) -> None:
-        if self.export_running:
+        if self.export_running or self.loudness_running:
             return
         previous_root = None
         current = self.usb_combo.currentData()
@@ -496,7 +728,7 @@ class MainWindow(QMainWindow):
         self.usb_destination_field.setToolTip(str(path))
 
     def choose_usb_folder(self) -> None:
-        if self.export_running:
+        if self.export_running or self.loudness_running:
             return
         drive = self.usb_combo.currentData()
         if not isinstance(drive, UsbDrive):
@@ -519,7 +751,7 @@ class MainWindow(QMainWindow):
         self._update_controls()
 
     def copy_to_usb(self) -> None:
-        if self.export_running:
+        if self.export_running or self.loudness_running:
             return
         drive = self.usb_combo.currentData()
         if not isinstance(drive, UsbDrive):
@@ -656,6 +888,15 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        if self.loudness_running:
+            self.cancel_loudness()
+            QMessageBox.information(
+                self,
+                "Loudness Synchronization in Progress",
+                "Cancellation was requested. Wait for FFmpeg to stop before closing.",
+            )
+            event.ignore()
+            return
         if self.export_running:
             self.cancel_export()
             QMessageBox.information(

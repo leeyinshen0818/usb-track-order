@@ -8,6 +8,7 @@ from pathlib import Path
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
+from app import __version__
 from app.main_window import MainWindow
 
 
@@ -21,10 +22,15 @@ def resource_path(relative_path: str) -> Path:
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("USB Track Order")
-    icon_path = resource_path("icon/usb.ico")
+    app.setApplicationVersion(__version__)
+    app.setOrganizationName("USB Track Order")
+    icon_path = resource_path("icon/Icon2.png")
     if icon_path.exists():
-        app.setWindowIcon(QIcon(str(icon_path)))
+        icon = QIcon(str(icon_path))
+        app.setWindowIcon(icon)
     window = MainWindow()
+    if icon_path.exists():
+        window.setWindowIcon(icon)
     window.show()
     return app.exec()
 

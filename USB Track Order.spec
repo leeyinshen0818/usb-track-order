@@ -1,16 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from imageio_ffmpeg import get_ffmpeg_exe
+
+
+ffmpeg_exe = get_ffmpeg_exe()
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
-    datas=[('icon/usb.ico', 'icon')],
+    binaries=[(ffmpeg_exe, 'ffmpeg')],
+    datas=[('icon/Icon2.png', 'icon')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['imageio_ffmpeg'],
     noarchive=False,
     optimize=0,
 )
@@ -35,5 +39,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['icon/usb.ico'],
+    icon=['icon/Icon2.ico'],
+    version='version_info.txt',
 )
