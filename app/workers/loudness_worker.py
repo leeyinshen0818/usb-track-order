@@ -1,24 +1,32 @@
-"""Qt worker that keeps FFmpeg loudness processing off the UI thread."""
+"""Qt worker that measures loudness off the UI thread (sources are never modified)."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from pathlib import Path
+
 from PySide6.QtCore import QObject, Signal, Slot
 
-from app.services.loudness_sync import (
+from app.services.loudness import (
+    AnalysisProgress,
     CancellationToken,
-    LoudnessPlan,
-    LoudnessProgress,
-    synchronize_loudness,
+    LoudnessCache,
+    analyze_loudness,
+    plan_analysis,
 )
 
 
-class LoudnessWorker(QObject):
+class LoudnessAnalysisWorker(QObject):
     progress = Signal(object)
     finished = Signal(object)
 
-    def __init__(self, plan: LoudnessPlan) -> None:
+    def __init__(
+        self, paths: Sequence[Path], cache: LoudnessCache, ffmpeg_path: str
+    ) -> None:
         super().__init__()
-        self.plan = plan
+        self.paths = tuple(paths)
+        self.cache = cache
+        self.ffmpeg_path = ffmpeg_path
         self.cancellation = CancellationToken()
 
     def request_cancel(self) -> None:
@@ -26,10 +34,17 @@ class LoudnessWorker(QObject):
 
     @Slot()
     def run(self) -> None:
-        result = synchronize_loudness(
-            self.plan, self.cancellation, progress=self._emit_progress
+        jobs, cached, failures = plan_analysis(self.paths, self.cache)
+        result = analyze_loudness(
+            jobs,
+            self.cache,
+            self.ffmpeg_path,
+            self.cancellation,
+            cached_count=cached,
+            initial_failures=failures,
+            progress=self._emit_progress,
         )
         self.finished.emit(result)
 
-    def _emit_progress(self, update: LoudnessProgress) -> None:
+    def _emit_progress(self, update: AnalysisProgress) -> None:
         self.progress.emit(update)

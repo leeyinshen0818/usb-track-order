@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QStandardPaths, QThread, Qt
+from PySide6.QtCore import QSettings, QStandardPaths, QThread, QTimer, Qt
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QComboBox,
@@ -22,8 +22,25 @@ from PySide6.QtWidgets import (
 )
 
 from app import __version__
-from app.models.track import Track
-from app.services.file_scanner import FileScanError, scan_folder
+from app.paths import data_dir, settings_ini_override
+from app.services.file_scanner import (
+    FileScanError,
+    count_interrupted_renames,
+    remove_leftover_temp_files,
+    scan_folder,
+)
+from app.services.rename_journal import (
+    clear_receipt,
+    load_receipt,
+    receipt_belongs_to,
+    recover_interrupted_rename,
+    save_receipt,
+)
+from app.services.track_flags import (
+    FolderHistory,
+    find_new_tracks,
+    find_possible_duplicates,
+)
 from app.services.filename_numbering import (
     build_apply_numbering_plan,
     build_remove_numbering_plan,
@@ -36,16 +53,16 @@ from app.services.safe_renamer import (
     RenameValidationError,
     SafeRenamer,
 )
-from app.services.loudness_sync import (
+from app.services.loudness import (
     DEFAULT_TARGET_LUFS,
     MAX_TARGET_LUFS,
     MIN_TARGET_LUFS,
-    LoudnessPlan,
-    LoudnessProgress,
-    LoudnessResult,
-    LoudnessStatus,
+    AnalysisProgress,
+    AnalysisResult,
+    AnalysisStatus,
+    LoudnessCache,
     LoudnessValidationError,
-    build_loudness_plan,
+    discover_ffmpeg,
     validate_target_lufs,
 )
 from app.services.track_sorting import (
@@ -78,7 +95,16 @@ from app.widgets.track_list import (
     TrackListWidget,
 )
 from app.workers.usb_export_worker import UsbExportWorker
-from app.workers.loudness_worker import LoudnessWorker
+from app.workers.loudness_worker import LoudnessAnalysisWorker
+
+def default_settings() -> QSettings:
+    """Registry settings, or an INI file in the overridden data directory."""
+
+    ini = settings_ini_override()
+    if ini is not None:
+        return QSettings(str(ini), QSettings.IniFormat)
+    return QSettings("USB Track Order", "USB Track Order")
+
 
 SORT_COLUMNS = {
     FILENAME_COLUMN: SortField.FILENAME,
@@ -89,23 +115,39 @@ SORT_COLUMNS = {
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, settings: QSettings | None = None) -> None:
+    def __init__(
+        self,
+        settings: QSettings | None = None,
+        loudness_cache: LoudnessCache | None = None,
+        ffmpeg_path: str | None = None,
+    ) -> None:
         super().__init__()
-        self.settings = settings or QSettings("USB Track Order", "USB Track Order")
+        self.settings = settings or default_settings()
+        self.loudness_cache = (
+            loudness_cache if loudness_cache is not None else LoudnessCache()
+        )
+        self.ffmpeg_path = ffmpeg_path or discover_ffmpeg()
         self.setWindowTitle(f"USB Track Order v{__version__}")
         self.resize(1020, 760)
         self.setMinimumSize(760, 600)
-        self.safe_renamer = SafeRenamer()
+        state_dir = data_dir()
+        self.rename_journal_path = state_dir / "rename_journal.json"
+        self.undo_receipt_path = state_dir / "last_rename.json"
+        self.folder_history = FolderHistory(state_dir / "folder_history.json")
+        self.previous_folder_names: set[str] | None = None
+        self.safe_renamer = SafeRenamer(journal_path=self.rename_journal_path)
         self.last_rename: RenameReceipt | None = None
         self.sort_state = SortState.custom()
         self.export_running = False
         self.export_thread: QThread | None = None
         self.export_worker: UsbExportWorker | None = None
         self.pending_export_result: ExportResult | None = None
-        self.loudness_running = False
-        self.loudness_thread: QThread | None = None
-        self.loudness_worker: LoudnessWorker | None = None
-        self.pending_loudness_result: LoudnessResult | None = None
+        self.analysis_running = False
+        self.analysis_thread: QThread | None = None
+        self.analysis_worker: LoudnessAnalysisWorker | None = None
+        self.pending_analysis_result: AnalysisResult | None = None
+        self.queued_analysis_paths: list[Path] | None = None
+        self.analysis_failures: dict[str, str] = {}
         self.usb_destination_path: Path | None = None
         self.usb_destination_drive_id: tuple[str, int | str, int] | None = None
 
@@ -131,9 +173,11 @@ class MainWindow(QMainWindow):
 
         library_status = QHBoxLayout()
         self.count_label = QLabel("0 songs")
+        self.notice_label = QLabel("")
         self.sort_label = QLabel("Sort: Custom Order")
         self.sort_label.setStyleSheet("color: palette(mid);")
         library_status.addWidget(self.count_label)
+        library_status.addWidget(self.notice_label)
         library_status.addStretch()
         library_status.addWidget(self.sort_label)
         layout.addLayout(library_status)
@@ -185,11 +229,9 @@ class MainWindow(QMainWindow):
             saved_target = DEFAULT_TARGET_LUFS
         self.target_lufs.setValue(saved_target)
         self.target_lufs.setSuffix(" LUFS")
-        self.synchronize_loudness_button = QPushButton("Synchronize Loudness")
         self.cancel_loudness_button = QPushButton("Cancel")
         loudness_controls.addWidget(QLabel("Target Loudness:"))
         loudness_controls.addWidget(self.target_lufs)
-        loudness_controls.addWidget(self.synchronize_loudness_button)
         loudness_controls.addWidget(self.cancel_loudness_button)
         loudness_tools.addLayout(loudness_controls)
 
@@ -269,7 +311,6 @@ class MainWindow(QMainWindow):
         self.apply_numbering_button.clicked.connect(self.apply_numbering)
         self.remove_numbering_button.clicked.connect(self.remove_numbering)
         self.undo_rename_button.clicked.connect(self.undo_last_rename)
-        self.synchronize_loudness_button.clicked.connect(self.synchronize_loudness)
         self.cancel_loudness_button.clicked.connect(self.cancel_loudness)
         self.target_lufs.valueChanged.connect(self._save_target_lufs)
         self.track_list.selection_changed.connect(self._update_controls)
@@ -282,6 +323,35 @@ class MainWindow(QMainWindow):
         self.cancel_copy_button.clicked.connect(self.cancel_export)
         self.refresh_usb_drives()
         self._update_controls()
+        QTimer.singleShot(0, self.recover_interrupted_rename)
+
+    def recover_interrupted_rename(self) -> None:
+        """Roll back a rename that a crash left half-done, then report it."""
+
+        report = recover_interrupted_rename(self.rename_journal_path)
+        if report is None:
+            return
+        if report.complete:
+            QMessageBox.information(self, "Interrupted Rename Restored", report.summary())
+        else:
+            QMessageBox.warning(self, "Interrupted Rename — Check Files", report.summary())
+        if self.folder_path.text():
+            self.load_folder(self.folder_path.text())
+
+    def _refresh_track_flags(self) -> None:
+        tracks = self.track_list.tracks
+        duplicates = find_possible_duplicates(tracks)
+        self.track_list.set_flags(
+            find_new_tracks(tracks, self.previous_folder_names), duplicates
+        )
+        notices = []
+        interrupted = count_interrupted_renames(tracks)
+        if interrupted:
+            notices.append(f"Interrupted rename detected: {interrupted} files")
+        if duplicates:
+            notices.append(f"{len(duplicates)} possible duplicates")
+        self.notice_label.setText(" · ".join(notices))
+        self.notice_label.setVisible(bool(notices))
 
     def _save_target_lufs(self, value: float) -> None:
         self.settings.setValue("audio/target_lufs", float(value))
@@ -300,6 +370,9 @@ class MainWindow(QMainWindow):
             self.load_folder(selected)
 
     def load_folder(self, folder: str | Path) -> None:
+        if self.export_running:
+            return
+        remove_leftover_temp_files(folder)
         try:
             tracks = scan_folder(folder)
         except FileScanError as exc:
@@ -308,16 +381,23 @@ class MainWindow(QMainWindow):
 
         self.folder_path.setText(str(folder))
         self.folder_path.setToolTip(str(folder))
+        self.previous_folder_names = self.folder_history.previous_names(folder)
+        self.folder_history.record(folder, tracks)
         self.track_list.set_tracks(
             tracks, "No supported audio files found in this folder."
         )
-        self.last_rename = None
+        self._refresh_track_flags()
+        saved = load_receipt(self.undo_receipt_path)
+        self.last_rename = (
+            saved if saved is not None and receipt_belongs_to(saved, folder) else None
+        )
         self.sort_state = SortState.custom()
         self.sort_label.setText("Sort: Custom Order")
         self.track_list.show_sort_indicator(None, None)
         count = len(tracks)
         self.count_label.setText(f"{count} song" if count == 1 else f"{count} songs")
         self._update_controls()
+        self.start_loudness_analysis()
 
     def _update_controls(self) -> None:
         rows = self.track_list.selected_rows()
@@ -330,16 +410,18 @@ class MainWindow(QMainWindow):
         already_at_top = rows == list(range(len(rows)))
         bottom_start = track_count - len(rows)
         already_at_bottom = rows == list(range(bottom_start, track_count))
-        available = not self.export_running and not self.loudness_running
+        available = not self.export_running
+        # FFmpeg holds analyzed files open, so renames and export wait for analysis.
+        files_idle = available and not self.analysis_running
         self.open_button.setEnabled(available)
         self.move_top_button.setEnabled(available and bool(rows) and not already_at_top)
         self.move_up_button.setEnabled(available and can_move_up)
         self.move_down_button.setEnabled(available and can_move_down)
         self.move_bottom_button.setEnabled(available and bool(rows) and not already_at_bottom)
-        self.apply_numbering_button.setEnabled(available and track_count > 0)
-        self.remove_numbering_button.setEnabled(available and track_count > 0)
+        self.apply_numbering_button.setEnabled(files_idle and track_count > 0)
+        self.remove_numbering_button.setEnabled(files_idle and track_count > 0)
         self.undo_rename_button.setEnabled(
-            available
+            files_idle
             and self.last_rename is not None
             and bool(self.last_rename.actions)
         )
@@ -349,19 +431,22 @@ class MainWindow(QMainWindow):
             available and self.usb_combo.currentData() is not None
         )
         self.copy_to_usb_button.setEnabled(
-            available
+            files_idle
             and track_count > 0
             and self.usb_combo.currentData() is not None
             and self.usb_destination_path is not None
         )
         self.cancel_copy_button.setEnabled(self.export_running)
         self.target_lufs.setEnabled(available)
-        self.synchronize_loudness_button.setEnabled(available and track_count > 0)
-        self.cancel_loudness_button.setEnabled(self.loudness_running)
+        self.cancel_loudness_button.setEnabled(
+            self.analysis_running
+            and self.analysis_worker is not None
+            and not self.analysis_worker.cancellation.cancelled
+        )
         self.track_list.set_order_changes_enabled(available)
 
     def sort_by_column(self, column: int) -> None:
-        if self.export_running or self.loudness_running or column not in SORT_COLUMNS:
+        if self.export_running or column not in SORT_COLUMNS:
             return
         self.sort_state = next_sort_state(self.sort_state, SORT_COLUMNS[column])
         assert self.sort_state.field is not None
@@ -377,7 +462,7 @@ class MainWindow(QMainWindow):
         self._update_controls()
 
     def mark_custom_order(self) -> None:
-        if self.export_running or self.loudness_running:
+        if self.export_running:
             return
         self.sort_state = SortState.custom()
         self.sort_label.setText("Sort: Custom Order")
@@ -465,6 +550,8 @@ class MainWindow(QMainWindow):
             refresh_tracks_from_receipt(self.track_list.tracks, receipt)
         )
         self.last_rename = None
+        clear_receipt(self.undo_receipt_path)
+        self._refresh_track_flags()
         self._update_controls()
         self.statusBar().showMessage(
             "Successfully restored the previous filenames.", 10000
@@ -515,166 +602,128 @@ class MainWindow(QMainWindow):
             refresh_tracks_from_receipt(self.track_list.tracks, receipt)
         )
         self.last_rename = receipt
+        save_receipt(self.undo_receipt_path, receipt)
+        self._refresh_track_flags()
         self._update_controls()
 
-    def synchronize_loudness(self) -> None:
-        if self.export_running or self.loudness_running:
+    def start_loudness_analysis(self) -> None:
+        """Measure uncached tracks in the background; sources are never modified."""
+
+        paths = [track.original_path for track in self.track_list.tracks]
+        if self.analysis_running:
+            # A newer folder replaces the running job once it has stopped.
+            self.queued_analysis_paths = paths
+            if self.analysis_worker is not None:
+                self.analysis_worker.request_cancel()
+            self._update_controls()
             return
-        selected_rows = self.track_list.selected_rows()
-        try:
-            plan = build_loudness_plan(
-                self.track_list.tracks,
-                selected_rows,
-                self.target_lufs.value(),
+        self.analysis_failures = {}
+        if not paths:
+            self._reset_analysis_display("Loudness: —")
+            return
+        if not self.ffmpeg_path:
+            self._reset_analysis_display("Loudness: FFmpeg not found")
+            self.statusBar().showMessage(
+                "FFmpeg was not found, so loudness cannot be measured.", 15000
             )
-        except LoudnessValidationError as exc:
-            QMessageBox.warning(self, "Cannot Synchronize Loudness", str(exc))
             return
 
-        scope = "selected" if selected_rows else "loaded"
-        answer = QMessageBox.question(
-            self,
-            "Synchronize Loudness",
-            f"Check {plan.selected_count} {scope} track(s) at "
-            f"{plan.target_lufs:.1f} LUFS?\n\n"
-            f"To process: {len(plan.tracks)}\n"
-            f"Already synchronized: {plan.skipped_count}\n\n"
-            "Each processed original is replaced only after FFmpeg safely creates "
-            "its temporary output. Filenames and list order will not change.",
-            QMessageBox.Yes | QMessageBox.Cancel,
-            QMessageBox.Cancel,
-        )
-        if answer != QMessageBox.Yes:
-            return
-        self._start_loudness_sync(plan)
-
-    def _start_loudness_sync(self, plan: LoudnessPlan) -> None:
-        self.loudness_running = True
-        self.pending_loudness_result = None
+        self.analysis_running = True
+        self.pending_analysis_result = None
         self.loudness_progress.setValue(0)
-        self.loudness_count_label.setText(
-            f"Done 0 | Skip {plan.skipped_count} | Fail 0 | "
-            f"Left {len(plan.tracks)}"
-        )
-        self.loudness_current_label.setText("Current: Preparing…")
+        self.loudness_count_label.setText(f"Checking {len(paths)}")
+        self.loudness_current_label.setText("Current: Checking loudness cache…")
 
         thread = QThread(self)
-        worker = LoudnessWorker(plan)
+        worker = LoudnessAnalysisWorker(paths, self.loudness_cache, self.ffmpeg_path)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.progress.connect(self._loudness_progressed)
-        worker.finished.connect(self._loudness_result_ready)
-        worker.finished.connect(thread.quit)
+        worker.progress.connect(self._analysis_progressed)
+        worker.finished.connect(self._analysis_result_ready)
+        # Direct so closeEvent can wait on the thread without the GUI loop running.
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._loudness_thread_finished)
+        thread.finished.connect(self._analysis_thread_finished)
         thread.finished.connect(thread.deleteLater)
-        self.loudness_thread = thread
-        self.loudness_worker = worker
+        self.analysis_thread = thread
+        self.analysis_worker = worker
         self._update_controls()
         thread.start()
 
+    def _reset_analysis_display(self, text: str) -> None:
+        self.loudness_progress.setValue(0)
+        self.loudness_count_label.setText("0 / 0")
+        self.loudness_current_label.setText(text)
+
     def cancel_loudness(self) -> None:
-        if self.loudness_worker is None or not self.loudness_running:
+        if self.analysis_worker is None or not self.analysis_running:
             return
-        self.loudness_worker.request_cancel()
+        self.analysis_worker.request_cancel()
         self.cancel_loudness_button.setEnabled(False)
         self.statusBar().showMessage(
-            "Cancellation requested. The original file will remain safe.", 10000
+            "Stopping loudness analysis. Finished measurements are kept.", 10000
         )
 
-    def _loudness_progressed(self, update: LoudnessProgress) -> None:
-        accounted = (
-            update.completed_count + update.skipped_count + update.failed_count
-        )
-        percent = (
-            int(accounted * 100 / update.total_count)
-            if update.total_count
-            else 100
-        )
+    def _analysis_progressed(self, update: AnalysisProgress) -> None:
+        if self.queued_analysis_paths is not None:
+            return
+        accounted = update.analyzed_count + update.cached_count + update.failed_count
+        percent = int(accounted * 100 / update.total_count) if update.total_count else 100
         self.loudness_progress.setValue(min(100, percent))
         remaining = max(0, update.total_count - accounted)
         self.loudness_count_label.setText(
-            f"Done {update.completed_count} | Skip {update.skipped_count} | "
+            f"Analyzed {update.analyzed_count} | Cached {update.cached_count} | "
             f"Fail {update.failed_count} | Left {remaining}"
         )
-        self.loudness_current_label.setText(f"Current: {update.current_filename}")
+        self.loudness_current_label.setText(f"Analyzing: {update.current_filename}")
 
-    def _loudness_result_ready(self, result: LoudnessResult) -> None:
-        self.pending_loudness_result = result
+    def _analysis_result_ready(self, result: AnalysisResult) -> None:
+        self.pending_analysis_result = result
 
-    def _loudness_thread_finished(self) -> None:
-        result = self.pending_loudness_result
-        self.loudness_running = False
-        self.loudness_worker = None
-        self.loudness_thread = None
-
-        refreshed = []
-        for track in self.track_list.tracks:
-            refreshed.append(
-                Track.from_path(track.original_path)
-                if track.original_path.exists()
-                else track
-            )
-        self.track_list.refresh_tracks(refreshed)
-        self._update_controls()
+    def _analysis_thread_finished(self) -> None:
+        result = self.pending_analysis_result
+        self.analysis_running = False
+        self.analysis_worker = None
+        self.analysis_thread = None
+        self.pending_analysis_result = None
+        queued = self.queued_analysis_paths
+        self.queued_analysis_paths = None
+        if queued is not None:
+            self._update_controls()
+            self.start_loudness_analysis()
+            return
         if result is not None:
-            self._show_loudness_result(result)
+            self.analysis_failures = dict(result.failures)
+            self._show_analysis_result(result)
+        self._update_controls()
 
-    def _show_loudness_result(self, result: LoudnessResult) -> None:
-        if result.status == LoudnessStatus.COMPLETED:
-            self.loudness_progress.setValue(100)
-            self.loudness_count_label.setText(
-                f"Done {result.completed_count} | Skip {result.skipped_count} | "
-                "Fail 0 | Left 0"
+    def _show_analysis_result(self, result: AnalysisResult) -> None:
+        accounted = result.analyzed_count + result.cached_count + result.failed_count
+        remaining = max(0, result.total_count - accounted)
+        self.loudness_count_label.setText(
+            f"Analyzed {result.analyzed_count} | Cached {result.cached_count} | "
+            f"Fail {result.failed_count} | Left {remaining}"
+        )
+        if result.status == AnalysisStatus.CANCELLED:
+            self.loudness_current_label.setText(
+                "Loudness: Analysis cancelled — reload the folder to resume"
             )
-            self.loudness_current_label.setText("Current: Complete")
+            return
+        self.loudness_progress.setValue(100)
+        if result.failed_count:
+            self.loudness_current_label.setText(
+                f"Loudness: {result.failed_count} file(s) could not be analyzed"
+            )
             self.statusBar().showMessage(
-                f"Loudness complete: {result.completed_count} processed, "
-                f"{result.skipped_count} skipped.",
+                f"{result.failed_count} track(s) could not be analyzed and will block "
+                "Copy to USB until fixed.",
                 15000,
             )
             return
-        if result.status == LoudnessStatus.CANCELLED:
-            self.loudness_current_label.setText("Current: Cancelled")
-            remaining = max(
-                0,
-                result.total_count
-                - result.completed_count
-                - result.skipped_count
-                - result.failed_count,
-            )
-            QMessageBox.information(
-                self,
-                "Loudness Synchronization Cancelled",
-                f"Processed: {result.completed_count}\n"
-                f"Skipped: {result.skipped_count}\n"
-                f"Failed: {result.failed_count}\n"
-                f"Remaining: {remaining}\n\n"
-                "Completed tracks remain normalized; the interrupted original is untouched.",
-            )
-            return
-        self.loudness_current_label.setText("Current: Failed")
-        remaining = max(
-            0,
-            result.total_count
-            - result.completed_count
-            - result.skipped_count
-            - result.failed_count,
-        )
-        QMessageBox.critical(
-            self,
-            "Loudness Synchronization Failed",
-            f"Processed: {result.completed_count}\n"
-            f"Skipped: {result.skipped_count}\n"
-            f"Failed: {result.failed_count}\n"
-            f"Remaining: {remaining}\n\n"
-            f"Failed file: {result.failed_filename or 'Unknown'}\n\n"
-            f"Reason: {result.reason or 'Unknown FFmpeg error'}\n\n"
-            "The failed file's original was not changed.",
-        )
+        self.loudness_current_label.setText("Loudness: Ready")
 
     def refresh_usb_drives(self) -> None:
-        if self.export_running or self.loudness_running:
+        if self.export_running:
             return
         previous_root = None
         current = self.usb_combo.currentData()
@@ -728,7 +777,7 @@ class MainWindow(QMainWindow):
         self.usb_destination_field.setToolTip(str(path))
 
     def choose_usb_folder(self) -> None:
-        if self.export_running or self.loudness_running:
+        if self.export_running:
             return
         drive = self.usb_combo.currentData()
         if not isinstance(drive, UsbDrive):
@@ -751,7 +800,7 @@ class MainWindow(QMainWindow):
         self._update_controls()
 
     def copy_to_usb(self) -> None:
-        if self.export_running or self.loudness_running:
+        if self.export_running or self.analysis_running:
             return
         drive = self.usb_combo.currentData()
         if not isinstance(drive, UsbDrive):
@@ -760,8 +809,15 @@ class MainWindow(QMainWindow):
             destination = validate_usb_destination(
                 drive.root, self.usb_destination_path or drive.root
             )
-            plan = build_export_plan(self.track_list.tracks, destination)
-        except UsbDestinationError as exc:
+            plan = build_export_plan(
+                self.track_list.tracks,
+                destination,
+                target_lufs=validate_target_lufs(self.target_lufs.value()),
+                state_cache=self.loudness_cache,
+                analysis_failures=self.analysis_failures,
+                ffmpeg_path=self.ffmpeg_path,
+            )
+        except (UsbDestinationError, LoudnessValidationError) as exc:
             QMessageBox.warning(self, "Cannot Start USB Export", str(exc))
             return
         except ExportValidationError as exc:
@@ -775,6 +831,10 @@ class MainWindow(QMainWindow):
         confirmation.setInformativeText(
             f"Destination folder:\n{plan.destination}\n\n"
             f"Total size: {format_bytes(plan.total_bytes)}\n\n"
+            f"Loudness target {plan.target_lufs:.1f} LUFS: "
+            f"{plan.normalized_count} track(s) adjusted, "
+            f"{len(plan.tracks) - plan.normalized_count} already within \u00b10.5 LU "
+            "(copied unchanged). Source files are never modified.\n\n"
             "Files will be copied sequentially in the exact order shown in the list."
         )
         confirmation.addButton(QMessageBox.Cancel)
@@ -888,15 +948,6 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
-        if self.loudness_running:
-            self.cancel_loudness()
-            QMessageBox.information(
-                self,
-                "Loudness Synchronization in Progress",
-                "Cancellation was requested. Wait for FFmpeg to stop before closing.",
-            )
-            event.ignore()
-            return
         if self.export_running:
             self.cancel_export()
             QMessageBox.information(
@@ -906,4 +957,10 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
             return
+        if self.analysis_running and self.analysis_worker is not None:
+            # Analysis is read-only: stop FFmpeg, keep finished results, then close.
+            self.queued_analysis_paths = None
+            self.analysis_worker.request_cancel()
+            if self.analysis_thread is not None:
+                self.analysis_thread.wait(10000)
         event.accept()

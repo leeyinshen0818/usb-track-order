@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from imageio_ffmpeg import get_ffmpeg_exe
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
 ffmpeg_exe = get_ffmpeg_exe()
@@ -9,8 +10,9 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[(ffmpeg_exe, 'ffmpeg')],
-    datas=[('icon/Icon2.png', 'icon')],
-    hiddenimports=[],
+    # pypinyin loads its dictionaries lazily; bundle every module and data file.
+    datas=[('icon/Icon2.png', 'icon'), *collect_data_files('pypinyin')],
+    hiddenimports=collect_submodules('pypinyin'),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

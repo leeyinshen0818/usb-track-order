@@ -74,15 +74,25 @@ def next_sort_state(current: SortState, field: SortField) -> SortState:
     return SortState(field, direction)
 
 
+def name_sort_key(filename: str) -> tuple:
+    """Shared, number-aware key for Latin and Chinese names.
+
+    The app's numbering prefix is ignored. Chinese characters become toneless
+    pinyin (traditional and simplified forms of a name map to the same key, so
+    周杰倫 and 周杰伦 sort together under Z); Latin text is casefolded.
+    """
+
+    base = strip_canonical_numbering(filename)
+    stem, dot, extension = base.rpartition(".")
+    if not dot or not stem:
+        stem, extension = base, ""
+    phonetic = "".join(lazy_pinyin(stem, errors="default")).casefold()
+    return (natural_sort_key(phonetic), phonetic, extension.casefold(), base.casefold())
+
+
 def _filename_key(track: Track) -> tuple:
-    base = strip_canonical_numbering(track.original_filename)
-    # Transliteration makes Chinese names participate in the same alphabetical
-    # order as Latin names: 林俊杰 -> linjunjie, 周杰伦 -> zhoujielun.
-    phonetic_name = "".join(lazy_pinyin(base, errors="default")).casefold()
     return (
-        natural_sort_key(phonetic_name),
-        phonetic_name,
-        base.casefold(),
+        name_sort_key(track.original_filename),
         track.original_filename.casefold(),
         str(track.original_path).casefold(),
     )

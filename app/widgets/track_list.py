@@ -15,9 +15,10 @@ from PySide6.QtCore import (
     Qt,
     Signal,
 )
-from PySide6.QtGui import QDrag, QDropEvent
+from PySide6.QtGui import QColor, QDrag, QDropEvent, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QHeaderView,
     QLabel,
     QStackedLayout,
@@ -44,12 +45,32 @@ MODIFIED_COLUMN = 2
 SIZE_COLUMN = 3
 TYPE_COLUMN = 4
 HEADERS = ("#", "Filename", "Date Modified", "Size", "Type")
+DUPLICATE_MARKER = "≈"  # "≈" beside the position number
+NEW_HIGHLIGHT_ALPHA = 38
 
 
 class TrackTableModel(QAbstractTableModel):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.tracks: list[Track] = []
+        self.new_paths: set = set()
+        self.duplicate_reasons: dict = {}
+
+    def set_flags(self, new_paths: set, duplicate_reasons: dict) -> None:
+        self.new_paths = set(new_paths)
+        self.duplicate_reasons = dict(duplicate_reasons)
+        if self.tracks:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(self.tracks) - 1, len(HEADERS) - 1),
+                [Qt.DisplayRole, Qt.BackgroundRole, Qt.ToolTipRole],
+            )
+
+    def is_new(self, row: int) -> bool:
+        return self.tracks[row].original_path in self.new_paths
+
+    def duplicate_reason(self, row: int) -> str | None:
+        return self.duplicate_reasons.get(self.tracks[row].original_path)
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
         return 0 if parent.isValid() else len(self.tracks)
@@ -63,7 +84,10 @@ class TrackTableModel(QAbstractTableModel):
         if role == Qt.DisplayRole:
             track = self.tracks[index.row()]
             if index.column() == ORDER_COLUMN:
-                return preview_number(index.row() + 1)
+                number = preview_number(index.row() + 1)
+                if self.duplicate_reason(index.row()):
+                    return f"{number} {DUPLICATE_MARKER}"
+                return number
             if index.column() == FILENAME_COLUMN:
                 return track.original_filename
             if index.column() == MODIFIED_COLUMN:
@@ -76,8 +100,20 @@ class TrackTableModel(QAbstractTableModel):
                 return track.file_type
         if role == Qt.TextAlignmentRole and index.column() in (ORDER_COLUMN, SIZE_COLUMN):
             return int(Qt.AlignCenter)
-        if role == Qt.ToolTipRole and index.column() == FILENAME_COLUMN:
-            return str(self.tracks[index.row()].original_path)
+        if role == Qt.BackgroundRole and self.is_new(index.row()):
+            color = QColor(QApplication.palette().color(QPalette.Highlight))
+            color.setAlpha(NEW_HIGHLIGHT_ALPHA)
+            return color
+        if role == Qt.ToolTipRole and index.column() in (ORDER_COLUMN, FILENAME_COLUMN):
+            notes = []
+            if index.column() == FILENAME_COLUMN:
+                notes.append(str(self.tracks[index.row()].original_path))
+            if self.is_new(index.row()):
+                notes.append("New: not numbered yet or added since the last load")
+            reason = self.duplicate_reason(index.row())
+            if reason:
+                notes.append(f"Possible duplicate — {reason}")
+            return "\n".join(notes) or None
         return None
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):  # noqa: N802
@@ -223,6 +259,9 @@ class TrackListWidget(QWidget):
             for row, track in enumerate(loaded)
             if track.original_path in selected_paths
         )
+
+    def set_flags(self, new_paths: set, duplicate_reasons: dict) -> None:
+        self.model.set_flags(new_paths, duplicate_reasons)
 
     def show_sort_indicator(
         self, column: int | None, direction: SortDirection | None

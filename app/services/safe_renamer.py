@@ -12,6 +12,8 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+RENAME_TEMP_PREFIX = ".__usb_track_order_tmp_"
+
 _INVALID_WINDOWS_CHARS = frozenset('<>:"/\\|?*')
 _RESERVED_WINDOWS_NAMES = {
     "CON",
@@ -109,9 +111,11 @@ class SafeRenamer:
         self,
         rename: Callable[[Path, Path], None] | None = None,
         token_factory: Callable[[], str] | None = None,
+        journal_path: Path | None = None,
     ) -> None:
         self._rename = rename or self._default_rename
         self._token_factory = token_factory or (lambda: uuid.uuid4().hex)
+        self.journal_path = journal_path
 
     @staticmethod
     def _default_rename(source: Path, target: Path) -> None:
@@ -210,6 +214,7 @@ class SafeRenamer:
         }
         temporary_paths = [self._new_temp_path(action.source, reserved) for action in plan]
         current_paths = [action.source for action in plan]
+        journal = self._write_journal(plan, temporary_paths)
 
         try:
             for index, (action, temporary) in enumerate(zip(plan, temporary_paths)):
@@ -221,6 +226,8 @@ class SafeRenamer:
         except OSError as exc:
             logger.exception("Rename operation failed; attempting rollback")
             rollback_errors = self._rollback(plan, current_paths, reserved)
+            if not rollback_errors and journal is not None:
+                self._clear_journal(journal)
             if rollback_errors:
                 affected = [
                     current
@@ -240,6 +247,8 @@ class SafeRenamer:
                 rollback_complete=True,
             ) from exc
 
+        if journal is not None:
+            self._clear_journal(journal)
         identities: list[tuple[int, int, int, int] | None] = []
         for action in plan:
             try:
@@ -248,13 +257,47 @@ class SafeRenamer:
                 identities.append(None)
         return RenameReceipt(plan, tuple(identities))
 
+    def _write_journal(self, plan, temporary_paths):
+        """Persist the plan before touching any file; refuse to start otherwise."""
+
+        if self.journal_path is None:
+            return None
+        from app.services.rename_journal import JournalEntry, RenameJournal
+
+        journal = RenameJournal(self.journal_path)
+        entries = []
+        for action, temporary in zip(plan, temporary_paths):
+            try:
+                stat = action.source.stat()
+            except OSError as exc:
+                raise RenameValidationError(
+                    f'Source file can no longer be inspected: "{action.source.name}"'
+                ) from exc
+            entries.append(
+                JournalEntry(action.source, temporary, action.target, stat.st_ino, stat.st_size)
+            )
+        try:
+            journal.write(entries)
+        except OSError as exc:
+            raise RenameValidationError(
+                f"The rename journal could not be written, so nothing was renamed: {exc}"
+            ) from exc
+        return journal
+
+    @staticmethod
+    def _clear_journal(journal) -> None:
+        try:
+            journal.clear()
+        except OSError:
+            logger.warning("Could not remove rename journal %s", journal.path)
+
     def _new_temp_path(self, source: Path, reserved: set[str]) -> Path:
         for _attempt in range(100):
             token = re.sub(r"[^A-Za-z0-9_-]", "", self._token_factory())
             if not token:
                 continue
             candidate = source.with_name(
-                f".__usb_track_order_tmp_{token}{source.suffix}"
+                f"{RENAME_TEMP_PREFIX}{token}{source.suffix}"
             )
             key = _path_key(candidate)
             if key not in reserved and not candidate.exists():

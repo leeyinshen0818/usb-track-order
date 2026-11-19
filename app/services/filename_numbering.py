@@ -10,9 +10,17 @@ from app.models.track import Track
 from app.services.safe_renamer import RenameAction, RenameReceipt
 from app.services.track_ordering import preview_number
 
-# The application always emits at least three digits. Requiring that emitted
-# width also protects legitimate titles such as "99 Luftballons.mp3".
-_CANONICAL_PREFIX = re.compile(r"^[0-9]{3,} ([^ ].*)$")
+# The application emits "NNN " (three digits, or 1000+ without a leading zero)
+# followed by the original name. Requiring that width protects titles such as
+# "99 Luftballons.mp3" and "7 rings.mp3"; refusing a remainder that starts with
+# a separator protects artist names such as "5566 - Song.mp3".
+_CANONICAL_PREFIX = re.compile(
+    r"^(?:[0-9]{3}|[1-9][0-9]{3,}) (?![-\u2013\u2014_.,&+)\]])([^ ].*)$"
+)
+
+
+def has_canonical_numbering(filename: str) -> bool:
+    return strip_canonical_numbering(filename) != filename
 
 
 def strip_canonical_numbering(filename: str) -> str:

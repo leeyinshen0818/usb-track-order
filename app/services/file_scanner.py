@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import fnmatch
+import logging
 import re
 from pathlib import Path
 from typing import TypeAlias
 
 from app.models.track import Track
+from app.services.safe_renamer import RENAME_TEMP_PREFIX
 
 SUPPORTED_AUDIO_EXTENSIONS = frozenset({".mp3", ".flac", ".wav", ".m4a", ".aac"})
 NaturalPart: TypeAlias = tuple[int, int | str]
+
+# Disposable leftovers from interrupted v1 loudness runs and USB exports.
+# Rename temp files (".__usb_track_order_tmp_*") are NOT disposable: they hold
+# real songs when a rename was interrupted, so they are listed, never deleted.
+TEMP_FILE_PATTERNS = (".*loudness-*", "*.part")
+
+logger = logging.getLogger("usb_track_order.scanner")
 
 
 class FileScanError(RuntimeError):
@@ -20,6 +30,61 @@ def is_supported_audio(path: str | Path) -> bool:
     """Return whether a path has a supported extension, ignoring case."""
 
     return Path(path).suffix.casefold() in SUPPORTED_AUDIO_EXTENSIONS
+
+
+def is_temp_file(name: str) -> bool:
+    """Return whether *name* matches one of the app's temporary-file patterns."""
+
+    folded = name.casefold()
+    return any(fnmatch.fnmatchcase(folded, pattern) for pattern in TEMP_FILE_PATTERNS)
+
+
+def is_interrupted_rename_file(name: str) -> bool:
+    """A file left behind by an interrupted two-stage rename (holds a real song)."""
+
+    return name.casefold().startswith(RENAME_TEMP_PREFIX)
+
+
+def is_ignored_file(name: str) -> bool:
+    """Dot-files and disposable temp files are not listed as tracks.
+
+    Interrupted-rename files are the exception: they stay visible so no song
+    silently disappears from the list.
+    """
+
+    if is_interrupted_rename_file(name):
+        return False
+    return name.startswith(".") or is_temp_file(name)
+
+
+def count_interrupted_renames(tracks: list[Track]) -> int:
+    return sum(1 for track in tracks if is_interrupted_rename_file(track.original_filename))
+
+
+def remove_leftover_temp_files(folder: str | Path) -> list[Path]:
+    """Delete regular files directly in *folder* that match TEMP_FILE_PATTERNS.
+
+    Returns the paths that were removed. Failures are logged and skipped.
+    """
+
+    removed: list[Path] = []
+    try:
+        entries = list(Path(folder).iterdir())
+    except OSError:
+        return removed
+    for entry in entries:
+        if not is_temp_file(entry.name):
+            continue
+        try:
+            if not entry.is_file() or entry.is_symlink():
+                continue
+            entry.unlink()
+        except OSError as exc:
+            logger.warning("Could not remove leftover temp file %s: %s", entry, exc)
+            continue
+        logger.info("Removed leftover temp file %s", entry)
+        removed.append(entry)
+    return removed
 
 
 def natural_sort_key(filename: str) -> tuple[NaturalPart, ...]:
@@ -55,6 +120,8 @@ def scan_folder(folder: str | Path) -> list[Track]:
     tracks: list[Track] = []
     for entry in entries:
         try:
+            if is_ignored_file(entry.name):
+                continue
             if entry.is_file() and is_supported_audio(entry):
                 tracks.append(Track.from_path(entry))
         except OSError:

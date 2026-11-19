@@ -68,3 +68,53 @@ def test_scanned_track_exposes_file_metadata(tmp_path: Path) -> None:
 def test_missing_folder_has_friendly_error(tmp_path: Path) -> None:
     with pytest.raises(FileScanError, match="no longer exists"):
         scan_folder(tmp_path / "missing")
+
+
+def test_dot_and_temp_files_are_not_listed(tmp_path: Path) -> None:
+    for name in [
+        "song.mp3",
+        ".hidden.mp3",
+        ".song.loudness-0123abcd.mp3",
+        "song.mp3.part",
+        "other.flac.PART",
+    ]:
+        (tmp_path / name).touch()
+    assert [track.original_filename for track in scan_folder(tmp_path)] == ["song.mp3"]
+
+
+def test_leftover_temp_files_are_removed_but_others_kept(tmp_path: Path) -> None:
+    from app.services.file_scanner import remove_leftover_temp_files
+
+    leftovers = [".song.loudness-0123abcd.mp3", "song.mp3.part"]
+    kept = [
+        "song.mp3",
+        ".hidden.mp3",
+        "notes.txt",
+        "loudness-report.mp3",
+        "part.mp3",
+        ".__usb_track_order_tmp_abc.flac",
+        ".__USB_TRACK_ORDER_TMP_def.mp3",
+    ]
+    for name in leftovers + kept:
+        (tmp_path / name).touch()
+    (tmp_path / "folder.part").mkdir()
+
+    removed = remove_leftover_temp_files(tmp_path)
+    assert sorted(path.name for path in removed) == sorted(leftovers)
+    assert sorted(path.name for path in tmp_path.iterdir()) == sorted(kept + ["folder.part"])
+
+
+def test_interrupted_rename_files_are_listed_never_deleted(tmp_path: Path) -> None:
+    from app.services.file_scanner import (
+        count_interrupted_renames,
+        remove_leftover_temp_files,
+    )
+
+    (tmp_path / "song.mp3").write_bytes(b"a")
+    stranded = tmp_path / ".__usb_track_order_tmp_0123abcd.mp3"
+    stranded.write_bytes(b"real song")
+    remove_leftover_temp_files(tmp_path)
+    assert stranded.read_bytes() == b"real song"
+    tracks = scan_folder(tmp_path)
+    assert {t.original_filename for t in tracks} == {"song.mp3", stranded.name}
+    assert count_interrupted_renames(tracks) == 1

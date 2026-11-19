@@ -26,35 +26,32 @@ music files into a custom playback order before exporting them to USB drives.
 - Pre-export source, free-space, and destination-collision validation
 - Strictly sequential copying into the selected USB destination folder
 - Responsive background export with progress, cancellation, and size verification
-- Fast FFmpeg loudness synchronization from -20.0 to -10.0 LUFS
-- Six-track bounded processing with safe temporary replacement
-- Rename-safe local sync history that skips unchanged tracks at the same target
+- Automatic background loudness measurement (EBU R128) after a folder loads
+- Per-track loudness gain applied only to the USB copies; source files are never modified
+- Content-keyed measurement cache that survives copies, renames, and numbering
 
-Fast loudness mode uses single-pass normalization and writes normalized audio at
-48 kHz for broad car-audio compatibility and lower processing overhead.
+## Loudness
 
-## Loudness synchronization
+1. Open a folder. Uncached tracks are measured in the background (four at a time);
+   the progress bar shows analyzed, cached, failed, and remaining counts.
+2. Choose a target from -20.0 to -10.0 LUFS (default -14.0). Changing the target
+   does not re-measure anything.
+3. **Copy to USB** applies `target - measured LUFS` to each copy:
+   - within ±0.5 LU: copied byte-for-byte;
+   - otherwise re-encoded with the gain (MP3 → 256 kbps CBR, M4A/AAC → AAC 256 kbps,
+     FLAC → FLAC, WAV → 16-bit PCM), keeping sample rate, metadata, and cover art;
+   - positive gain is limited so the true peak stays at or below -1.5 dBTP.
 
-1. Open a folder containing supported music files.
-2. Optionally select specific tracks; with no selection, all loaded tracks are checked.
-3. Choose a target from -20.0 to -10.0 LUFS. The default is -14.0 LUFS.
-4. Select **Synchronize Loudness** and confirm the summary.
+Tracks without a measurement (still analyzing, or FFmpeg could not decode them)
+block the export with a list of the affected files. Measurements are stored in
+`%LOCALAPPDATA%\USB Track Order\loudness_state.json`, keyed by file size plus a
+hash of the first and last 64 KB, so renamed, numbered, or copied files (including
+files copied back from a USB drive) are not measured again. A log is written to
+`usb_track_order.log` in the same folder.
 
-Up to six tracks are processed concurrently. Each result is written to a temporary
-file and replaces its original only after FFmpeg exits successfully. Tracks already
-synchronized to the same target are skipped using rename-safe local state stored in
-`%LOCALAPPDATA%\USB Track Order\loudness_state.json`. The target setting is also
-remembered between launches.
-
-Limitations:
-
-- Fast mode uses single-pass normalization, so results are approximate rather than
-  mastering-grade measurements.
-- Normalized audio is encoded at 48 kHz. Lossy formats are re-encoded once.
-- Metadata and embedded artwork are preserved where the source container supports it.
-- Processing several tracks can temporarily use significant CPU and disk bandwidth.
-- Sync recognition uses file identity, size, timestamp, and sampled content; moving a
-  file to another filesystem may cause it to be processed again.
+Files are written to the USB drive as `<name>.part` and renamed once complete, one
+at a time in list order. Leftover temporary files in the music folder are removed
+when the folder is opened.
 
 Files are never renamed without explicit confirmation. Renaming changes only the
 filename: audio contents, extensions, and metadata are preserved.
