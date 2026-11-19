@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QStandardPaths, QThread, QTimer, Qt
+from PySide6.QtCore import QDir, QSettings, QSize, QStandardPaths, QThread, QTimer, Qt
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -87,6 +89,9 @@ from app.services.usb_exporter import (
     ExportValidationError,
     build_export_plan,
 )
+from app.ui.theme import set_primary, set_role, text_height, text_width
+from app.ui.tokens import SIZE, SPACE
+from app.ui.widgets import ElidedLabel, ResponsiveRow, panel
 from app.widgets.rename_preview import RenamePreviewDialog
 from app.widgets.track_list import (
     FILENAME_COLUMN,
@@ -151,8 +156,6 @@ class MainWindow(QMainWindow):
         # FFmpeg is located lazily, only when a unified-volume copy starts.
         self.ffmpeg_path = ffmpeg_path
         self.setWindowTitle(f"USB Track Order v{__version__}")
-        self.resize(1020, 760)
-        self.setMinimumSize(760, 600)
         state_dir = data_dir()
         self.rename_journal_path = state_dir / "rename_journal.json"
         self.undo_receipt_path = state_dir / "last_rename.json"
@@ -173,103 +176,112 @@ class MainWindow(QMainWindow):
         self.usb_destination_path: Path | None = None
         self.usb_destination_drive_id: tuple[str, int | str, int] | None = None
 
-        central = QWidget(self)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(18, 18, 18, 14)
-        layout.setSpacing(10)
+        page = QWidget()
+        page.setObjectName("pageContent")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(SPACE.md, SPACE.md, SPACE.md, SPACE.sm)
+        layout.setSpacing(SPACE.sm)
 
-        heading = QLabel(f"USB Track Order v{__version__}")
-        heading.setStyleSheet("font-size: 22px; font-weight: 600;")
-        layout.addWidget(heading)
-        layout.addWidget(QLabel("Local Folder"))
-
+        # --- music folder --------------------------------------------------
         folder_row = QHBoxLayout()
+        folder_row.setSpacing(SPACE.sm)
         self.folder_path = QLineEdit()
         self.folder_path.setReadOnly(True)
         self.folder_path.setPlaceholderText("Choose a folder containing music files")
+        self.folder_path.setMinimumWidth(text_width(self.folder_path, SIZE.field_min_chars))
         self.open_button = QPushButton("Open Folder")
         self.open_button.clicked.connect(self.open_folder)
+        folder_row.addWidget(QLabel("Music Folder:"))
         folder_row.addWidget(self.folder_path, 1)
         folder_row.addWidget(self.open_button)
         layout.addLayout(folder_row)
 
         library_status = QHBoxLayout()
-        self.count_label = QLabel("0 songs")
-        self.notice_label = QLabel("")
-        self.sort_label = QLabel("Sort: Custom Order")
-        self.sort_label.setStyleSheet("color: palette(mid);")
+        library_status.setSpacing(SPACE.md)
+        self.count_label = set_role(QLabel("0 songs"), "hint")
+        self.notice_label = set_role(QLabel(""), "notice")
+        self.sort_label = set_role(QLabel("Sort: Custom Order"), "hint")
         library_status.addWidget(self.count_label)
         library_status.addWidget(self.notice_label)
         library_status.addStretch()
         library_status.addWidget(self.sort_label)
         layout.addLayout(library_status)
 
-        library_tools = QHBoxLayout()
-        library_tools.setSpacing(18)
-
-        ordering_tools = QVBoxLayout()
-        ordering_tools.setSpacing(6)
-
-        controls = QHBoxLayout()
+        # --- grouped list tools -------------------------------------------
+        order_panel, order_layout = panel()
         self.move_top_button = QPushButton("Move Top")
         self.move_up_button = QPushButton("Move Up")
         self.move_down_button = QPushButton("Move Down")
         self.move_bottom_button = QPushButton("Move Bottom")
+        order_layout.addWidget(set_role(QLabel("Order"), "caption"))
         for button in (
             self.move_top_button,
             self.move_up_button,
             self.move_down_button,
             self.move_bottom_button,
         ):
-            controls.addWidget(button)
-        controls.addStretch()
-        ordering_tools.addLayout(controls)
+            order_layout.addWidget(button)
+        order_layout.addStretch()
 
-        rename_controls = QHBoxLayout()
+        numbering_panel, numbering_layout = panel()
         self.apply_numbering_button = QPushButton("Apply Numbering")
         self.remove_numbering_button = QPushButton("Remove Numbering")
         self.undo_rename_button = QPushButton("Undo Last Rename")
-        rename_controls.addWidget(self.apply_numbering_button)
-        rename_controls.addWidget(self.remove_numbering_button)
-        rename_controls.addWidget(self.undo_rename_button)
-        rename_controls.addStretch()
-        ordering_tools.addLayout(rename_controls)
-        library_tools.addLayout(ordering_tools, 1)
+        numbering_layout.addWidget(set_role(QLabel("Numbering"), "caption"))
+        numbering_layout.addWidget(self.apply_numbering_button)
+        numbering_layout.addWidget(self.remove_numbering_button)
+        numbering_layout.addWidget(self.undo_rename_button)
+        numbering_layout.addStretch()
 
-        layout.addLayout(library_tools)
+        self.tools_row = ResponsiveRow(
+            [(order_panel, 0), (numbering_panel, 0)], trailing_stretch=True
+        )
+        layout.addWidget(self.tools_row)
 
         self.track_list = TrackListWidget()
         layout.addWidget(self.track_list, 1)
 
-        usb_heading_row = QHBoxLayout()
-        usb_heading = QLabel("USB Destination")
-        usb_heading.setStyleSheet("font-weight: 600;")
-        self.usb_capacity_label = QLabel("No removable USB drive detected.")
-        self.usb_capacity_label.setStyleSheet("color: palette(mid);")
-        usb_heading_row.addWidget(usb_heading)
-        usb_heading_row.addStretch()
-        usb_heading_row.addWidget(self.usb_capacity_label)
-        layout.addLayout(usb_heading_row)
+        # --- destination and copy (one group, one primary action) ----------
+        usb_panel, usb_layout = panel(vertical=True)
 
-        usb_row = QHBoxLayout()
+        drive_part = QWidget()
+        drive_layout = QHBoxLayout(drive_part)
+        drive_layout.setContentsMargins(0, 0, 0, 0)
+        drive_layout.setSpacing(SPACE.sm)
         self.usb_combo = QComboBox()
+        self.usb_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.usb_combo.setMinimumContentsLength(SIZE.combo_min_chars)
         self.usb_refresh_button = QPushButton("Refresh")
-        usb_row.addWidget(QLabel("USB Drive:"))
-        usb_row.addWidget(self.usb_combo, 1)
-        usb_row.addWidget(self.usb_refresh_button)
-        layout.addLayout(usb_row)
+        self.usb_capacity_label = set_role(
+            QLabel("No removable USB drive detected."), "hint"
+        )
+        drive_layout.addWidget(QLabel("USB Drive:"))
+        drive_layout.addWidget(self.usb_combo, 1)
+        drive_layout.addWidget(self.usb_refresh_button)
+        drive_layout.addWidget(self.usb_capacity_label)
 
-        destination_row = QHBoxLayout()
+        destination_part = QWidget()
+        destination_layout = QHBoxLayout(destination_part)
+        destination_layout.setContentsMargins(0, 0, 0, 0)
+        destination_layout.setSpacing(SPACE.sm)
         self.usb_destination_field = QLineEdit()
         self.usb_destination_field.setReadOnly(True)
         self.usb_destination_field.setPlaceholderText("Select a removable USB drive")
+        self.usb_destination_field.setMinimumWidth(
+            text_width(self.usb_destination_field, SIZE.field_min_chars)
+        )
         self.choose_usb_folder_button = QPushButton("Choose Folder")
-        destination_row.addWidget(QLabel("Destination Folder:"))
-        destination_row.addWidget(self.usb_destination_field, 1)
-        destination_row.addWidget(self.choose_usb_folder_button)
-        layout.addLayout(destination_row)
+        destination_layout.addWidget(QLabel("Destination Folder:"))
+        destination_layout.addWidget(self.usb_destination_field, 1)
+        destination_layout.addWidget(self.choose_usb_folder_button)
 
-        volume_row = QHBoxLayout()
+        self.destination_row = ResponsiveRow([(drive_part, 1), (destination_part, 1)])
+        usb_layout.addWidget(self.destination_row)
+
+        copy_row = QHBoxLayout()
+        copy_row.setSpacing(SPACE.sm)
         self.unify_volume_checkbox = QCheckBox("Unify volume")
         self.unify_volume_checkbox.setToolTip(
             "Measure each track and adjust the volume of the USB copies to one "
@@ -281,6 +293,7 @@ class MainWindow(QMainWindow):
         self.target_lufs_container = QWidget()
         target_layout = QHBoxLayout(self.target_lufs_container)
         target_layout.setContentsMargins(0, 0, 0, 0)
+        target_layout.setSpacing(SPACE.sm)
         self.target_lufs = QDoubleSpinBox()
         self.target_lufs.setRange(MIN_TARGET_LUFS, MAX_TARGET_LUFS)
         self.target_lufs.setDecimals(1)
@@ -296,33 +309,37 @@ class MainWindow(QMainWindow):
         target_layout.addWidget(QLabel("Target Loudness:"))
         target_layout.addWidget(self.target_lufs)
         self.target_lufs_container.setVisible(self.unify_volume_checkbox.isChecked())
-        volume_row.addWidget(self.unify_volume_checkbox)
-        volume_row.addWidget(self.target_lufs_container)
-        volume_row.addStretch()
-        layout.addLayout(volume_row)
-
-        export_row = QHBoxLayout()
-        self.copy_to_usb_button = QPushButton("Copy to USB")
+        self.copy_to_usb_button = set_primary(QPushButton("Copy to USB"))
         self.cancel_copy_button = QPushButton("Cancel Copy")
         self.export_progress = QProgressBar()
         self.export_progress.setRange(0, 100)
         self.export_progress.setValue(0)
+        self.export_progress.setMinimumWidth(text_width(self.export_progress, 6))
         self.export_count_label = QLabel("0 / 0 tracks")
-        self.export_current_label = QLabel("Current: —")
-        self.export_current_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        export_row.addWidget(self.copy_to_usb_button)
-        export_row.addWidget(self.cancel_copy_button)
-        export_row.addWidget(self.export_progress, 1)
-        export_row.addWidget(self.export_count_label)
-        export_row.addWidget(self.export_current_label)
-        layout.addLayout(export_row)
+        self.export_current_label = ElidedLabel("Current: —")
+        copy_row.addWidget(self.unify_volume_checkbox)
+        copy_row.addWidget(self.target_lufs_container)
+        copy_row.addWidget(self.export_progress, 2)
+        copy_row.addWidget(self.export_count_label)
+        copy_row.addWidget(self.export_current_label, 3)
+        copy_row.addWidget(self.cancel_copy_button)
+        copy_row.addWidget(self.copy_to_usb_button)
+        usb_layout.addLayout(copy_row)
+        layout.addWidget(usb_panel)
 
-        safety_note = QLabel(
+        # Safety net: on very small screens the page scrolls instead of clipping.
+        scroll = QScrollArea()
+        scroll.setObjectName("page")
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(page)
+        self.setCentralWidget(scroll)
+
+        safety_note = ElidedLabel(
             "Ordering is held in memory. Files are renamed only after confirmation."
         )
-        safety_note.setStyleSheet("color: palette(mid);")
-        layout.addWidget(safety_note)
-        self.setCentralWidget(central)
+        self.statusBar().addWidget(safety_note, 1)
+        self._apply_window_size()
 
         self.move_top_button.clicked.connect(self.track_list.move_selected_top)
         self.move_up_button.clicked.connect(self.track_list.move_selected_up)
@@ -344,6 +361,17 @@ class MainWindow(QMainWindow):
         self.refresh_usb_drives()
         self._update_controls()
         QTimer.singleShot(0, self.recover_interrupted_rename)
+
+    def _apply_window_size(self) -> None:
+        """Size from font metrics, never larger than the screen's free area."""
+
+        line = text_height(self)
+        self.setMinimumSize(QSize(line * 24, line * 16))
+        wanted = QSize(line * SIZE.window_width_lines, line * SIZE.window_height_lines)
+        screen = self.screen()
+        if screen is not None:
+            wanted = wanted.boundedTo(screen.availableGeometry().size())
+        self.resize(wanted)
 
     def recover_interrupted_rename(self) -> None:
         """Roll back a rename that a crash left half-done, then report it."""
@@ -403,8 +431,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Unable to Open Folder", str(exc))
             return
 
-        self.folder_path.setText(str(folder))
-        self.folder_path.setToolTip(str(folder))
+        shown = QDir.toNativeSeparators(str(folder))
+        self.folder_path.setText(shown)
+        self.folder_path.setToolTip(shown)
         self.previous_folder_names = self.folder_history.previous_names(folder)
         self.folder_history.record(folder, tracks)
         self.track_list.set_tracks(
@@ -675,8 +704,9 @@ class MainWindow(QMainWindow):
         path = Path(destination)
         self.usb_destination_path = path
         self.usb_destination_drive_id = drive.identity_key
-        self.usb_destination_field.setText(str(path))
-        self.usb_destination_field.setToolTip(str(path))
+        shown = QDir.toNativeSeparators(str(path))
+        self.usb_destination_field.setText(shown)
+        self.usb_destination_field.setToolTip(shown)
 
     def choose_usb_folder(self) -> None:
         if self.export_running:

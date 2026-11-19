@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable
 from datetime import datetime
 
 from PySide6.QtCore import (
+    QEvent,
     QAbstractTableModel,
     QByteArray,
     QItemSelectionModel,
@@ -15,10 +16,9 @@ from PySide6.QtCore import (
     Qt,
     Signal,
 )
-from PySide6.QtGui import QColor, QDrag, QDropEvent, QPalette
+from PySide6.QtGui import QColor, QDrag, QDropEvent, QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QHeaderView,
     QLabel,
     QStackedLayout,
@@ -37,6 +37,8 @@ from app.services.track_ordering import (
 )
 from app.services.track_sorting import SortDirection
 from app.services.usb_drives import format_bytes
+from app.ui.theme import set_role
+from app.ui.tokens import COLOR, SIZE, SPACE
 
 ROWS_MIME_TYPE = "application/x-usb-track-order-rows"
 ORDER_COLUMN = 0
@@ -46,7 +48,6 @@ SIZE_COLUMN = 3
 TYPE_COLUMN = 4
 HEADERS = ("#", "Filename", "Date Modified", "Size", "Type")
 DUPLICATE_MARKER = "≈"  # "≈" beside the position number
-NEW_HIGHLIGHT_ALPHA = 38
 
 
 class TrackTableModel(QAbstractTableModel):
@@ -101,8 +102,8 @@ class TrackTableModel(QAbstractTableModel):
         if role == Qt.TextAlignmentRole and index.column() in (ORDER_COLUMN, SIZE_COLUMN):
             return int(Qt.AlignCenter)
         if role == Qt.BackgroundRole and self.is_new(index.row()):
-            color = QColor(QApplication.palette().color(QPalette.Highlight))
-            color.setAlpha(NEW_HIGHLIGHT_ALPHA)
+            color = QColor(COLOR.new_row_tint)
+            color.setAlphaF(COLOR.new_row_alpha)
             return color
         if role == Qt.ToolTipRole and index.column() in (ORDER_COLUMN, FILENAME_COLUMN):
             notes = []
@@ -154,11 +155,48 @@ class TrackTableView(QTableView):
         header.setSectionsClickable(True)
         header.setSortIndicatorShown(False)
         header.sectionClicked.connect(self.sort_requested.emit)
-        header.setSectionResizeMode(ORDER_COLUMN, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(FILENAME_COLUMN, QHeaderView.Stretch)
-        header.setSectionResizeMode(MODIFIED_COLUMN, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(SIZE_COLUMN, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(TYPE_COLUMN, QHeaderView.ResizeToContents)
+        header.setHighlightSections(False)
+        self.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.setWordWrap(False)
+        self.setTextElideMode(Qt.ElideMiddle)
+        self._apply_row_metrics()
+
+    def setModel(self, model) -> None:  # noqa: N802
+        super().setModel(model)
+        self._apply_column_modes()
+
+    def _apply_column_modes(self) -> None:
+        """Filename fills the width; other columns fit their contents.
+
+        Applied after setModel: setting a model resets the header's sections.
+        """
+
+        header = self.horizontalHeader()
+        for column in range(header.count()):
+            header.setSectionResizeMode(
+                column,
+                QHeaderView.Stretch
+                if column == FILENAME_COLUMN
+                else QHeaderView.ResizeToContents,
+            )
+
+    def row_height(self) -> int:
+        return QFontMetrics(self.font()).height() + SIZE.row_padding
+
+    def _apply_row_metrics(self) -> None:
+        """Compact rows sized from the font, so any scale factor stays crisp."""
+
+        height = self.row_height()
+        rows = self.verticalHeader()
+        rows.setMinimumSectionSize(height)
+        rows.setDefaultSectionSize(height)
+        header_height = self.horizontalHeader().sizeHint().height()
+        self.setMinimumHeight(header_height + height * SIZE.min_table_rows + 2 * self.frameWidth())
+
+    def changeEvent(self, event: QEvent) -> None:  # noqa: N802
+        super().changeEvent(event)
+        if event.type() in (QEvent.FontChange, QEvent.StyleChange):
+            self._apply_row_metrics()
 
     def startDrag(self, supported_actions: Qt.DropActions) -> None:  # noqa: N802
         rows = sorted({index.row() for index in self.selectionModel().selectedRows()})
@@ -222,7 +260,8 @@ class TrackListWidget(QWidget):
 
         self.empty_label = QLabel("No music folder selected.", self)
         self.empty_label.setAlignment(Qt.AlignCenter)
-        self.empty_label.setStyleSheet("color: palette(mid); font-size: 14px; padding: 32px;")
+        self.empty_label.setMargin(SPACE.lg)
+        set_role(self.empty_label, "hint")
 
         self.stack = QStackedLayout(self)
         self.stack.addWidget(self.empty_label)

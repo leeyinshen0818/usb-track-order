@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from PySide6.QtCore import QSize
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.services.safe_renamer import RenameAction
+from app.ui.theme import set_role, text_height
 
 
 def _preview_lines(actions: Sequence[RenameAction]) -> list[str]:
@@ -42,7 +44,12 @@ class RenamePreviewDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(680, 430)
+        line = text_height(self)
+        size = QSize(line * 40, line * 26)
+        screen = self.screen()
+        if screen is not None:
+            size = size.boundedTo(screen.availableGeometry().size())
+        self.resize(size)
 
         layout = QVBoxLayout(self)
         summary_label = QLabel(summary)
@@ -54,7 +61,9 @@ class RenamePreviewDialog(QDialog):
         preview.setPlainText("\n".join(_preview_lines(actions)))
         layout.addWidget(preview, 1)
 
-        note = QLabel("Files will be renamed only after you confirm this operation.")
+        note = set_role(
+            QLabel("Files will be renamed only after you confirm this operation."), "hint"
+        )
         note.setWordWrap(True)
         layout.addWidget(note)
 

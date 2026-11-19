@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication
 from app import __version__
 from app.main_window import MainWindow
 from app.paths import data_dir
+from app.ui.theme import apply_theme, configure_high_dpi
 
 LOG_MAX_BYTES = 1024 * 1024
 
@@ -60,7 +61,9 @@ def main() -> int:
     if "--self-test" in sys.argv:
         return self_test()
     configure_logging()
+    configure_high_dpi()
     app = QApplication(sys.argv)
+    apply_theme(app)
     app.setApplicationName("USB Track Order")
     app.setApplicationVersion(__version__)
     app.setOrganizationName("USB Track Order")
