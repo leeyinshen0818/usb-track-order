@@ -1,4 +1,4 @@
-# USB Track Order v2.0.0
+# USB Track Order v3.0.0
 
 USB Track Order is a lightweight Windows desktop utility for arranging local
 music files into a custom playback order before exporting them to USB drives.
