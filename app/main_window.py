@@ -389,11 +389,17 @@ class MainWindow(QMainWindow):
         """Size from font metrics, never larger than the screen's free area."""
 
         line = text_height(self)
-        self.setMinimumSize(QSize(line * 24, line * 16))
+        self.setMinimumSize(
+            QSize(line * SIZE.window_min_width_lines, line * SIZE.window_min_height_lines)
+        )
         wanted = QSize(line * SIZE.window_width_lines, line * SIZE.window_height_lines)
         screen = self.screen()
         if screen is not None:
-            wanted = wanted.boundedTo(screen.availableGeometry().size())
+            available = screen.availableGeometry().size()
+            fraction = SIZE.window_max_screen_fraction
+            wanted = wanted.boundedTo(
+                QSize(int(available.width() * fraction), int(available.height() * fraction))
+            )
         self.resize(wanted)
 
     def recover_interrupted_rename(self) -> None:

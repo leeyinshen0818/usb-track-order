@@ -28,6 +28,7 @@ for fonts in (Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts", Path("/usr
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PySide6.QtCore import QSettings  # noqa: E402
+from PySide6.QtGui import QFontMetricsF  # noqa: E402
 from PySide6.QtWidgets import QApplication, QLayout, QWidget  # noqa: E402
 
 import app.main_window as main_window  # noqa: E402
@@ -35,6 +36,7 @@ from app.models.track import Track  # noqa: E402
 from app.services.loudness import LoudnessCache  # noqa: E402
 from app.services.usb_drives import UsbDrive  # noqa: E402
 from app.ui.theme import apply_theme, configure_high_dpi  # noqa: E402
+from app.ui.tokens import ui_scale  # noqa: E402
 
 # Windows taskbar (48) + title bar (~31), in logical pixels at any scale.
 WINDOW_CHROME = 80
@@ -76,7 +78,12 @@ def check(window: main_window.MainWindow) -> dict:
                     overlaps.append(f"{type(first).__name__} / {type(second).__name__}")
     table = window.track_list.table
     scroll = window.centralWidget()
+    dpr = window.devicePixelRatioF()
     return {
+        "ui_scale": ui_scale(),
+        # Physical (device) pixels, comparable across scale factors.
+        "button_height_px": window.copy_to_usb_button.height() * dpr,
+        "font_height_px": QFontMetricsF(window.font()).height() * dpr,
         "too_small": too_small,
         "overlaps": overlaps,
         "visible_rows": table.viewport().height() // table.row_height(),

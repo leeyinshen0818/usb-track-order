@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication
 from app import __version__
 from app.main_window import MainWindow
 from app.paths import data_dir
-from app.ui.theme import apply_theme, configure_high_dpi
+from app.ui.theme import apply_theme, configure_high_dpi, follow_screen_scale
 
 LOG_MAX_BYTES = 1024 * 1024
 
@@ -75,6 +75,7 @@ def main() -> int:
     if icon_path.exists():
         window.setWindowIcon(icon)
     window.show()
+    follow_screen_scale(window)
     return app.exec()
 
 

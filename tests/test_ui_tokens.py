@@ -59,3 +59,12 @@ def test_stylesheet_keeps_row_tints_visible() -> None:
     # Any QTableView::item rule makes Qt's stylesheet engine paint item
     # backgrounds itself and ignore the model's new/duplicate row tints.
     assert "::item" not in build_stylesheet()
+
+
+@pytest.mark.parametrize(
+    "dpr, expected", [(1.0, 1.0), (1.25, 1.0), (1.5, 0.85), (1.75, 0.85), (2.0, 0.85)]
+)
+def test_ui_scale_table(dpr: float, expected: float) -> None:
+    from app.ui.tokens import ui_scale_for
+
+    assert ui_scale_for(dpr) == pytest.approx(expected)

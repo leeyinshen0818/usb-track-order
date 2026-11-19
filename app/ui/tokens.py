@@ -1,13 +1,44 @@
 """Design tokens: the single source of spacing, radii, font sizes, and colors.
 
 Sizes are logical pixels (Qt scales them by the device pixel ratio) and font
-sizes are points, so the UI looks the same at 100 %, 125 %, and 150 %.
-Text heights are never fixed here: widgets derive them from font metrics.
+sizes are points. On top of that, ``ui_scale`` keeps the PHYSICAL size close to
+the 125 % baseline: at 150 % and above everything is drawn at 0.85x, so shop
+PCs do not look ~20 % bigger. Reading ``SPACE``, ``RADIUS``, ``FONT`` or
+``SIZE`` returns already-scaled values; counts and ratios are never scaled,
+and borders stay 1 px. Text heights are never fixed here: widgets derive them
+from font metrics.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+
+BASELINE_DPR = 1.25  # the dev laptop: 1920x1080 at 125 %
+MIN_UI_SCALE = 0.85
+MAX_UI_SCALE = 1.0
+_ui_scale = MAX_UI_SCALE
+
+
+def ui_scale_for(device_pixel_ratio: float) -> float:
+    """clamp(1.25 / DPR, 0.85, 1.0)."""
+
+    if device_pixel_ratio <= 0:
+        return MAX_UI_SCALE
+    return max(MIN_UI_SCALE, min(MAX_UI_SCALE, BASELINE_DPR / device_pixel_ratio))
+
+
+def ui_scale() -> float:
+    return _ui_scale
+
+
+def set_ui_scale(device_pixel_ratio: float) -> bool:
+    """Set the scale for a screen's DPR; True when it changed."""
+
+    global _ui_scale
+    scale = ui_scale_for(device_pixel_ratio)
+    changed = scale != _ui_scale
+    _ui_scale = scale
+    return changed
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,7 +61,7 @@ class FontSizes:
 
     body: float = 10.0
     caption: float = 10.0
-    sort_glyph_scale: float = 1.25  # symbol fonts draw arrows small
+    sort_glyph_scale: float = 1.25  # ratio: symbol fonts draw arrows small
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,21 +114,60 @@ class Colors:
 
 @dataclass(frozen=True, slots=True)
 class Sizes:
-    """Ratios, not pixels: multiplied by font-metric heights at runtime."""
+    """Pixel sizes (scaled) plus counts/ratios (never scaled, see UNSCALED)."""
 
-    row_padding: int = 6  # added to the font height for table rows
+    row_padding: int = 6  # px added to the font height for table rows
+    indicator: int = 14  # px: check box / radio indicator
+    icon_small: int = 16  # px: button, item, and small icons
+    icon_large: int = 32  # px: message box icons
     min_table_rows: int = 5  # below this, the page scrolls instead
     window_width_lines: int = 64  # default window size in text-line heights
     window_height_lines: int = 40
+    window_min_width_lines: int = 24
+    window_min_height_lines: int = 16
+    window_max_screen_fraction: float = 0.9  # of the available screen area
     combo_min_chars: int = 18
     field_min_chars: int = 12
 
 
-SPACE = Spacing()
-RADIUS = Radii()
-FONT = FontSizes()
+class _Scaled:
+    """Read-only view of a token dataclass with pixel/point values scaled."""
+
+    def __init__(self, base: object, unscaled: frozenset[str] = frozenset()) -> None:
+        object.__setattr__(self, "_base", base)
+        object.__setattr__(self, "_unscaled", unscaled)
+
+    def __getattr__(self, name: str):
+        value = getattr(self._base, name)
+        if name in self._unscaled or isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return max(1, round(value * _ui_scale)) if value > 0 else value
+        if isinstance(value, float):
+            return round(value * _ui_scale, 2)
+        return value
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("Design tokens are read-only.")
+
+    def base(self, name: str):
+        """The unscaled value (for tests and diagnostics)."""
+
+        return getattr(self._base, name)
+
+
+SPACE = _Scaled(Spacing())
+RADIUS = _Scaled(Radii())
+FONT = _Scaled(FontSizes(), frozenset({"sort_glyph_scale"}))
 COLOR = Colors()
-SIZE = Sizes()
+SIZE = _Scaled(
+    Sizes(),
+    frozenset(
+        f.name
+        for f in fields(Sizes)
+        if f.name not in {"row_padding", "indicator", "icon_small", "icon_large"}
+    ),
+)
 
 FONT_FAMILY = "Segoe UI"
 MIN_TEXT_CONTRAST = 4.5

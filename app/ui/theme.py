@@ -1,12 +1,17 @@
-"""Applies the calm dark theme. Every value comes from ``app.ui.tokens``."""
+"""Applies the calm dark theme. Every value comes from ``app.ui.tokens``.
+
+``apply_theme`` sets ``ui_scale`` from the screen's device pixel ratio before
+building fonts and the stylesheet; ``follow_screen_scale`` rebuilds them when
+the window moves to a screen with a different DPR.
+"""
 
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPalette
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPalette, QScreen
 from PySide6.QtWidgets import QApplication, QProxyStyle, QStyle, QStyleFactory, QWidget
 
-from app.ui.tokens import COLOR, FONT, FONT_FAMILY, RADIUS, SPACE
+from app.ui.tokens import COLOR, FONT, FONT_FAMILY, RADIUS, SIZE, SPACE, set_ui_scale
 
 # Dynamic properties read by the stylesheet.
 ROLE_PROPERTY = "role"  # "hint" | "notice" | "caption"
@@ -215,11 +220,31 @@ QToolTip {{
 
 
 class AccentCheckStyle(QProxyStyle):
-    """Fusion, with a checked check box filled in the single accent color.
+    """Fusion, with a checked check box filled in the single accent color, and
+    indicator/icon sizes taken from the (scaled) size tokens.
 
     Fusion paints the box from palette roles (Base fill, Window-derived
-    outline, Text check mark), so only those roles change; geometry does not.
+    outline, Text check mark), so only those roles change.
     """
+
+    _TOKEN_METRICS = {
+        QStyle.PM_IndicatorWidth: "indicator",
+        QStyle.PM_IndicatorHeight: "indicator",
+        QStyle.PM_ExclusiveIndicatorWidth: "indicator",
+        QStyle.PM_ExclusiveIndicatorHeight: "indicator",
+        QStyle.PM_SmallIconSize: "icon_small",
+        QStyle.PM_ButtonIconSize: "icon_small",
+        QStyle.PM_ListViewIconSize: "icon_small",
+        QStyle.PM_TabBarIconSize: "icon_small",
+        QStyle.PM_MessageBoxIconSize: "icon_large",
+        QStyle.PM_LargeIconSize: "icon_large",
+    }
+
+    def pixelMetric(self, metric, option=None, widget=None):  # noqa: N802
+        token = self._TOKEN_METRICS.get(metric)
+        if token is not None:
+            return getattr(SIZE, token)
+        return super().pixelMetric(metric, option, widget)
 
     def drawPrimitive(self, element, option, painter, widget=None):  # noqa: N802
         if (
@@ -237,9 +262,15 @@ class AccentCheckStyle(QProxyStyle):
         super().drawPrimitive(element, option, painter, widget)
 
 
-def apply_theme(app: QApplication) -> None:
-    """Same look on every PC: Fusion style, token palette, font, stylesheet."""
+def apply_theme(app: QApplication, screen: QScreen | None = None) -> None:
+    """Same look on every PC: Fusion style, token palette, font, stylesheet.
 
+    ``screen`` defaults to the primary screen, where the window will open, so
+    call this before creating the window.
+    """
+
+    screen = screen or app.primaryScreen()
+    set_ui_scale(screen.devicePixelRatio() if screen is not None else 1.0)
     fusion = QStyleFactory.create("Fusion")
     if fusion is not None:
         app.setStyle(AccentCheckStyle(fusion))
@@ -250,3 +281,20 @@ def apply_theme(app: QApplication) -> None:
     font.setPointSizeF(FONT.body)
     app.setFont(font)
     app.setStyleSheet(build_stylesheet())
+
+
+def follow_screen_scale(window: QWidget) -> None:
+    """Rebuild fonts and stylesheet when the window moves to a screen whose
+    DPR gives a different ``ui_scale``. Call after the window is shown."""
+
+    handle = window.windowHandle()
+    if handle is None:
+        return
+
+    def screen_changed(screen: QScreen | None) -> None:
+        if screen is None:
+            return
+        if set_ui_scale(screen.devicePixelRatio()):
+            apply_theme(QApplication.instance(), screen)
+
+    handle.screenChanged.connect(screen_changed)
