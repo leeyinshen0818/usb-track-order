@@ -374,8 +374,6 @@ def make_window(tmp_path: Path, monkeypatch):
     app()
     monkeypatch.setattr("app.main_window.discover_removable_drives", lambda: [])
     settings = QSettings(str(tmp_path / "s.ini"), QSettings.IniFormat)
-    # No FFmpeg: analysis is skipped so rename buttons stay usable.
-    monkeypatch.setattr("app.main_window.discover_ffmpeg", lambda: None)
     return MainWindow(settings=settings, loudness_cache=LoudnessCache(tmp_path / "c.json"))
 
 

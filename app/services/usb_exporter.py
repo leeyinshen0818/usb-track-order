@@ -97,6 +97,9 @@ class ExportPlan:
     target_lufs: float | None = None
     ffmpeg_path: str | None = None
     state_cache: LoudnessCache | None = None
+    # "<filename> — <reason>" for tracks copied at original volume because
+    # they have no measurement (only with allow_unmeasured=True).
+    unmeasured: tuple[str, ...] = ()
 
     @property
     def normalized_count(self) -> int:
@@ -137,12 +140,15 @@ def build_export_plan(
     state_cache: LoudnessCache | None = None,
     analysis_failures: Mapping[str, str] | None = None,
     ffmpeg_path: str | None = None,
+    allow_unmeasured: bool = False,
 ) -> ExportPlan:
     """Validate sources, loudness data, space, and collisions before any write.
 
-    With ``target_lufs`` set, every track must have a cached measurement; a
-    track that is missing one blocks the export (it is never copied silently
-    un-normalized). Without ``target_lufs`` every track is a plain copy.
+    With ``target_lufs`` set, every track needs a cached measurement. A track
+    missing one blocks the export, unless ``allow_unmeasured`` is set: then it
+    is a plain copy (original volume, same position) and is listed in
+    ``ExportPlan.unmeasured``. Without ``target_lufs`` every track is a plain
+    copy and FFmpeg is never looked up.
     """
 
     root = Path(destination)
@@ -218,7 +224,7 @@ def build_export_plan(
             )
         )
 
-    if missing:
+    if missing and not allow_unmeasured:
         shown = "\n".join(missing[:15])
         if len(missing) > 15:
             shown += f"\n… and {len(missing) - 15} more"
@@ -279,6 +285,7 @@ def build_export_plan(
         target_lufs,
         executable,
         state_cache if target_lufs is not None else None,
+        tuple(missing),
     )
 
 
