@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 from pathlib import Path
 
@@ -35,6 +36,18 @@ def isolated_app_data(tmp_path_factory, monkeypatch) -> Path:
     monkeypatch.setenv("XDG_STATE_HOME", str(root / "xdg-state"))
     monkeypatch.setenv("XDG_DATA_HOME", str(root / "xdg-data"))
     return root
+
+
+@pytest.fixture(autouse=True)
+def collect_garbage_on_main_thread():
+    """Collect each test's leftover Qt wrappers on the GUI thread.
+
+    Otherwise a later test's worker thread may trigger the cyclic garbage
+    collector and destroy those Qt objects off the GUI thread (access violation).
+    """
+
+    yield
+    gc.collect()
 
 
 def pytest_sessionfinish(session, exitstatus) -> None:

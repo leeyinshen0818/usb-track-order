@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from app.models.track import Track
+from app.services.file_scanner import natural_sort_key
 from app.services.safe_renamer import RenameAction, RenameReceipt
 from app.services.track_ordering import preview_number
 
@@ -40,6 +41,17 @@ def numbered_filename(filename: str, position: int) -> str:
     """Return the canonical filename for a one-based visual position."""
 
     return f"{preview_number(position)} {strip_canonical_numbering(filename)}"
+
+
+def filenames_follow_order(tracks: Sequence[Track]) -> bool:
+    """True when sorting the filenames by name gives the list order.
+
+    That is what a player sorting by filename would play. False after an
+    unapplied reorder, so Apply Numbering is still needed.
+    """
+
+    keys = [natural_sort_key(track.original_filename) for track in tracks]
+    return all(first <= second for first, second in zip(keys, keys[1:]))
 
 
 def build_apply_numbering_plan(tracks: Sequence[Track]) -> list[RenameAction]:

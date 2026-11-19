@@ -53,3 +53,9 @@ def test_stylesheet_has_no_untokenized_values() -> None:
     assert colors
     for color in colors:
         assert color.casefold() in allowed_colors, color
+
+
+def test_stylesheet_keeps_row_tints_visible() -> None:
+    # Any QTableView::item rule makes Qt's stylesheet engine paint item
+    # backgrounds itself and ignore the model's new/duplicate row tints.
+    assert "::item" not in build_stylesheet()

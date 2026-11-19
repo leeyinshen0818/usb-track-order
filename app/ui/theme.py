@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPalette
-from PySide6.QtWidgets import QApplication, QStyleFactory, QWidget
+from PySide6.QtWidgets import QApplication, QProxyStyle, QStyle, QStyleFactory, QWidget
 
 from app.ui.tokens import COLOR, FONT, FONT_FAMILY, RADIUS, SPACE
 
 # Dynamic properties read by the stylesheet.
 ROLE_PROPERTY = "role"  # "hint" | "notice" | "caption"
 PRIMARY_PROPERTY = "primary"
+SOFT_ACCENT_PROPERTY = "softAccent"
 PANEL_NAME = "panel"
 
 
@@ -45,6 +46,17 @@ def set_role(widget: QWidget, role: str) -> QWidget:
 def set_primary(widget: QWidget) -> QWidget:
     widget.setProperty(PRIMARY_PROPERTY, True)
     return widget
+
+
+def set_soft_accent(widget: QWidget, on: bool) -> None:
+    """Toggle the quieter accent used for a pending step; re-polishes."""
+
+    if bool(widget.property(SOFT_ACCENT_PROPERTY)) == on:
+        return
+    widget.setProperty(SOFT_ACCENT_PROPERTY, on)
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+    widget.update()
 
 
 def build_palette() -> QPalette:
@@ -123,7 +135,13 @@ QPushButton[{PRIMARY_PROPERTY}="true"] {{
     font-weight: 600;
 }}
 QPushButton[{PRIMARY_PROPERTY}="true"]:hover {{ background: {c.accent_hover_bg}; }}
-QPushButton:disabled, QPushButton[{PRIMARY_PROPERTY}="true"]:disabled {{
+QPushButton[{SOFT_ACCENT_PROPERTY}="true"] {{
+    background: {c.soft_accent_bg};
+    border-color: {c.soft_accent_border};
+}}
+QPushButton[{SOFT_ACCENT_PROPERTY}="true"]:hover {{ background: {c.soft_accent_hover_bg}; }}
+QPushButton:disabled, QPushButton[{PRIMARY_PROPERTY}="true"]:disabled,
+QPushButton[{SOFT_ACCENT_PROPERTY}="true"]:disabled {{
     background: {c.disabled_bg};
     color: {c.disabled_text};
     border: 1px dashed {c.disabled_border};
@@ -155,10 +173,10 @@ QComboBox QAbstractItemView {{
 QCheckBox {{ color: {c.text}; spacing: {s.sm}px; }}
 QCheckBox:disabled {{ color: {c.disabled_text}; }}
 QTableView {{
-    background: {c.input_bg};
+    background: {c.table_bg};
     alternate-background-color: {c.table_alt_bg};
     color: {c.text};
-    gridline-color: {c.border};
+    qproperty-showGrid: false;
     border: 1px solid {c.border};
     border-radius: {r.sm}px;
     selection-background-color: {c.selection_bg};
@@ -173,9 +191,10 @@ QHeaderView::section {{
     border-bottom: 1px solid {c.border};
     font-weight: 600;
 }}
+QHeaderView::section:hover {{ background: {c.header_hover_bg}; }}
 QProgressBar {{
     background: {c.input_bg};
-    color: {c.text};
+    color: {c.progress_text};
     border: 1px solid {c.border};
     border-radius: {r.sm}px;
     text-align: center;
@@ -195,12 +214,35 @@ QToolTip {{
 """
 
 
+class AccentCheckStyle(QProxyStyle):
+    """Fusion, with a checked check box filled in the single accent color.
+
+    Fusion paints the box from palette roles (Base fill, Window-derived
+    outline, Text check mark), so only those roles change; geometry does not.
+    """
+
+    def drawPrimitive(self, element, option, painter, widget=None):  # noqa: N802
+        if (
+            element == QStyle.PE_IndicatorCheckBox
+            and option.state & QStyle.State_On
+            and option.state & QStyle.State_Enabled
+        ):
+            option = type(option)(option)
+            palette = QPalette(option.palette)
+            palette.setColor(QPalette.Base, QColor(COLOR.accent_bg))
+            # Fusion's outline is Window.darker(140): aim it at accent_border.
+            palette.setColor(QPalette.Window, QColor(COLOR.accent_border).lighter(140))
+            palette.setColor(QPalette.Text, QColor(COLOR.accent_text))
+            option.palette = palette
+        super().drawPrimitive(element, option, painter, widget)
+
+
 def apply_theme(app: QApplication) -> None:
     """Same look on every PC: Fusion style, token palette, font, stylesheet."""
 
     fusion = QStyleFactory.create("Fusion")
     if fusion is not None:
-        app.setStyle(fusion)
+        app.setStyle(AccentCheckStyle(fusion))
     app.setPalette(build_palette())
     for class_name in ("QCheckBox", "QAbstractSpinBox"):
         app.setPalette(build_indicator_palette(), class_name)

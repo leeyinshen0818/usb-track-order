@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 from pathlib import Path
 
 from PySide6.QtCore import QDir, QSettings, QSize, QStandardPaths, QThread, QTimer, Qt
@@ -39,14 +40,18 @@ from app.services.rename_journal import (
     recover_interrupted_rename,
     save_receipt,
 )
+from app.services.recycle_bin import move_to_trash
 from app.services.track_flags import (
+    DuplicateGroup,
     FolderHistory,
+    find_duplicate_groups,
     find_new_tracks,
     find_possible_duplicates,
 )
 from app.services.filename_numbering import (
     build_apply_numbering_plan,
     build_remove_numbering_plan,
+    filenames_follow_order,
     refresh_tracks_from_receipt,
 )
 from app.services.safe_renamer import (
@@ -89,9 +94,16 @@ from app.services.usb_exporter import (
     ExportValidationError,
     build_export_plan,
 )
-from app.ui.theme import set_primary, set_role, text_height, text_width
-from app.ui.tokens import SIZE, SPACE
+from app.ui.theme import (
+    set_primary,
+    set_role,
+    set_soft_accent,
+    text_height,
+    text_width,
+)
+from app.ui.tokens import COLOR, SIZE, SPACE
 from app.ui.widgets import ElidedLabel, ResponsiveRow, panel
+from app.widgets.duplicate_review import DuplicateReviewDialog
 from app.widgets.rename_preview import RenamePreviewDialog
 from app.widgets.track_list import (
     FILENAME_COLUMN,
@@ -107,6 +119,14 @@ UNIFY_VOLUME_KEY = "audio/unify_volume"
 TARGET_LUFS_KEY = "audio/target_lufs"
 FFMPEG_MISSING_REASON = "FFmpeg was not found, so volume cannot be measured"
 CONTINUE_UNMEASURED_LABEL = "Continue (these copy at original volume, order unchanged)"
+
+
+DEFAULT_STATUS_NOTE = (
+    "Ordering is held in memory. Files are renamed only after confirmation."
+)
+ORDER_CHANGED_NOTE = "Order changed. Click Apply Numbering to rename the files."
+DUPLICATES_LINK = "duplicates"
+NO_RECYCLE_BIN_MESSAGE = "Please copy the songs to the computer first, then delete."
 
 
 def _setting_is_true(value: object) -> bool:
@@ -200,6 +220,10 @@ class MainWindow(QMainWindow):
         library_status.setSpacing(SPACE.md)
         self.count_label = set_role(QLabel("0 songs"), "hint")
         self.notice_label = set_role(QLabel(""), "notice")
+        self.notice_label.setTextFormat(Qt.RichText)
+        self.notice_label.setTextInteractionFlags(Qt.LinksAccessibleByMouse)
+        self.notice_label.linkActivated.connect(self._notice_link_activated)
+        self.duplicate_groups: list[DuplicateGroup] = []
         self.sort_label = set_role(QLabel("Sort: Custom Order"), "hint")
         library_status.addWidget(self.count_label)
         library_status.addWidget(self.notice_label)
@@ -335,10 +359,8 @@ class MainWindow(QMainWindow):
         scroll.setWidget(page)
         self.setCentralWidget(scroll)
 
-        safety_note = ElidedLabel(
-            "Ordering is held in memory. Files are renamed only after confirmation."
-        )
-        self.statusBar().addWidget(safety_note, 1)
+        self.status_note = ElidedLabel(DEFAULT_STATUS_NOTE)
+        self.statusBar().addWidget(self.status_note, 1)
         self._apply_window_size()
 
         self.move_top_button.clicked.connect(self.track_list.move_selected_top)
@@ -353,6 +375,7 @@ class MainWindow(QMainWindow):
         self.track_list.selection_changed.connect(self._update_controls)
         self.track_list.sort_requested.connect(self.sort_by_column)
         self.track_list.manual_order_changed.connect(self.mark_custom_order)
+        self.track_list.remove_requested.connect(self.remove_selected_tracks)
         self.usb_refresh_button.clicked.connect(self.refresh_usb_drives)
         self.usb_combo.currentIndexChanged.connect(self._usb_selection_changed)
         self.choose_usb_folder_button.clicked.connect(self.choose_usb_folder)
@@ -388,18 +411,31 @@ class MainWindow(QMainWindow):
 
     def _refresh_track_flags(self) -> None:
         tracks = self.track_list.tracks
-        duplicates = find_possible_duplicates(tracks)
+        self.duplicate_groups = find_duplicate_groups(tracks)
+        duplicates = find_possible_duplicates(tracks, self.duplicate_groups)
         self.track_list.set_flags(
             find_new_tracks(tracks, self.previous_folder_names), duplicates
         )
         notices = []
         interrupted = count_interrupted_renames(tracks)
         if interrupted:
-            notices.append(f"Interrupted rename detected: {interrupted} files")
+            notices.append(html.escape(f"Interrupted rename detected: {interrupted} files"))
         if duplicates:
-            notices.append(f"{len(duplicates)} possible duplicates")
+            notices.append(
+                f'<a href="{DUPLICATES_LINK}" style="color: {COLOR.link};">'
+                f"{len(duplicates)} possible duplicates</a>"
+            )
         self.notice_label.setText(" · ".join(notices))
+        self.notice_label.setToolTip("Click to review duplicates" if duplicates else "")
         self.notice_label.setVisible(bool(notices))
+
+    def _update_count_label(self) -> None:
+        count = len(self.track_list.tracks)
+        self.count_label.setText(f"{count} song" if count == 1 else f"{count} songs")
+
+    def _notice_link_activated(self, link: str) -> None:
+        if link == DUPLICATES_LINK:
+            self.review_duplicates()
 
     def _save_target_lufs(self, value: float) -> None:
         self.settings.setValue(TARGET_LUFS_KEY, float(value))
@@ -447,8 +483,7 @@ class MainWindow(QMainWindow):
         self.sort_state = SortState.custom()
         self.sort_label.setText("Sort: Custom Order")
         self.track_list.show_sort_indicator(None, None)
-        count = len(tracks)
-        self.count_label.setText(f"{count} song" if count == 1 else f"{count} songs")
+        self._update_count_label()
         self._update_controls()
 
     def _update_controls(self) -> None:
@@ -470,6 +505,11 @@ class MainWindow(QMainWindow):
         self.move_down_button.setEnabled(available and can_move_down)
         self.move_bottom_button.setEnabled(available and bool(rows) and not already_at_bottom)
         self.apply_numbering_button.setEnabled(available and track_count > 0)
+        order_pending = track_count > 0 and not filenames_follow_order(
+            self.track_list.tracks
+        )
+        set_soft_accent(self.apply_numbering_button, available and order_pending)
+        self.status_note.setText(ORDER_CHANGED_NOTE if order_pending else DEFAULT_STATUS_NOTE)
         self.remove_numbering_button.setEnabled(available and track_count > 0)
         self.undo_rename_button.setEnabled(
             available
@@ -514,6 +554,66 @@ class MainWindow(QMainWindow):
         self.sort_state = SortState.custom()
         self.sort_label.setText("Sort: Custom Order")
         self.track_list.show_sort_indicator(None, None)
+        self._update_controls()
+
+    # --- duplicates and Recycle Bin -----------------------------------------
+
+    def review_duplicates(self) -> None:
+        if self.export_running or not self.duplicate_groups:
+            return
+        paths = DuplicateReviewDialog.review(self.duplicate_groups, self)
+        if paths:
+            self.move_tracks_to_recycle_bin(paths)
+
+    def remove_selected_tracks(self) -> None:
+        if self.export_running:
+            return
+        self.move_tracks_to_recycle_bin(self.track_list.selected_paths())
+
+    def _confirm_recycle(self, count: int) -> bool:
+        box = QMessageBox(self)
+        box.setWindowTitle("Move to Recycle Bin")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"Move {count} song(s) to the Recycle Bin?")
+        box.setInformativeText("You can restore them from the Recycle Bin later.")
+        move_button = box.addButton("Move to Recycle Bin", QMessageBox.AcceptRole)
+        cancel_button = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(cancel_button)
+        box.exec()
+        return box.clickedButton() is move_button
+
+    def move_tracks_to_recycle_bin(self, paths: list[Path]) -> None:
+        """Recycle (never permanently delete), then drop the rows in memory."""
+
+        if self.export_running or not paths:
+            return
+        if not self._confirm_recycle(len(paths)):
+            return
+        moved: list[Path] = []
+        failed: Path | None = None
+        for path in paths:
+            if not move_to_trash(path):
+                failed = path
+                break
+            moved.append(path)
+        if failed is not None and not moved:
+            QMessageBox.warning(self, "Cannot Move to Recycle Bin", NO_RECYCLE_BIN_MESSAGE)
+            return
+        if failed is not None:
+            QMessageBox.warning(
+                self,
+                "Cannot Move to Recycle Bin",
+                f"{len(moved)} song(s) were moved to the Recycle Bin, but "
+                f'"{failed.name}" could not be moved. The remaining songs were not '
+                "touched.",
+            )
+        self.track_list.remove_tracks(moved)
+        self._refresh_track_flags()
+        self._update_count_label()
+        self._update_controls()
+        self.statusBar().showMessage(
+            f"Moved {len(moved)} song(s) to the Recycle Bin.", 10000
+        )
 
     def apply_numbering(self) -> None:
         tracks = self.track_list.tracks
@@ -751,6 +851,12 @@ class MainWindow(QMainWindow):
         except ExportValidationError as exc:
             self._show_export_validation_error(exc)
             return
+        # Files keep their names on the USB; a player sorting by name would not
+        # follow the list order until Apply Numbering has renamed them.
+        if not filenames_follow_order(self.track_list.tracks) and not (
+            self._confirm_unapplied_order()
+        ):
+            return
 
         details = (
             f"Destination folder:\n{plan.destination}\n\n"
@@ -900,6 +1006,22 @@ class MainWindow(QMainWindow):
         box.setDefaultButton(QMessageBox.Cancel)
         box.exec()
         return box.clickedButton() is continue_button
+
+    def _confirm_unapplied_order(self) -> bool:
+        box = QMessageBox(self)
+        box.setWindowTitle("Copy to USB")
+        box.setIcon(QMessageBox.Warning)
+        box.setText("Order has not been applied to filenames. Copy anyway?")
+        box.setInformativeText(
+            "Files are copied in the list order, but they keep their current "
+            "names. Many car stereos play files sorted by name, so they may not "
+            "play in this order. Click Apply Numbering first to be sure."
+        )
+        copy_button = box.addButton("Copy Anyway", QMessageBox.AcceptRole)
+        cancel_button = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(cancel_button)
+        box.exec()
+        return box.clickedButton() is copy_button
 
     def _show_export_validation_error(self, error: ExportValidationError) -> None:
         details = str(error)

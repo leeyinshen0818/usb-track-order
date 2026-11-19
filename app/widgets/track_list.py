@@ -1,4 +1,5 @@
-"""Table widget with stable multi-selection and multi-row drag/drop."""
+"""Table widget with stable multi-selection, multi-row drag/drop, sortable
+headers that show their sort state, and a remove request (menu / Delete key)."""
 
 from __future__ import annotations
 
@@ -16,11 +17,12 @@ from PySide6.QtCore import (
     Qt,
     Signal,
 )
-from PySide6.QtGui import QColor, QDrag, QDropEvent, QFontMetrics
+from PySide6.QtGui import QColor, QDrag, QDropEvent, QFontMetrics, QKeyEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHeaderView,
     QLabel,
+    QMenu,
     QStackedLayout,
     QTableView,
     QWidget,
@@ -38,7 +40,7 @@ from app.services.track_ordering import (
 from app.services.track_sorting import SortDirection
 from app.services.usb_drives import format_bytes
 from app.ui.theme import set_role
-from app.ui.tokens import COLOR, SIZE, SPACE
+from app.ui.tokens import COLOR, FONT, SIZE, SPACE
 
 ROWS_MIME_TYPE = "application/x-usb-track-order-rows"
 ORDER_COLUMN = 0
@@ -48,6 +50,13 @@ SIZE_COLUMN = 3
 TYPE_COLUMN = 4
 HEADERS = ("#", "Filename", "Date Modified", "Size", "Type")
 DUPLICATE_MARKER = "≈"  # "≈" beside the position number
+SORTABLE_COLUMNS = frozenset({FILENAME_COLUMN, MODIFIED_COLUMN, SIZE_COLUMN, TYPE_COLUMN})
+SORT_GLYPH_INACTIVE = "\u21c5"  # ⇅
+SORT_GLYPH_ASCENDING = "\u25b2"  # ▲
+SORT_GLYPH_DESCENDING = "\u25bc"  # ▼
+SORT_TOOLTIP = "Click to sort"
+REMOVE_ACTION_TEXT = "Move to Recycle Bin"
+EMPTY_FOLDER_MESSAGE = "No supported audio files found in this folder."
 
 
 class TrackTableModel(QAbstractTableModel):
@@ -101,10 +110,16 @@ class TrackTableModel(QAbstractTableModel):
                 return track.file_type
         if role == Qt.TextAlignmentRole and index.column() in (ORDER_COLUMN, SIZE_COLUMN):
             return int(Qt.AlignCenter)
-        if role == Qt.BackgroundRole and self.is_new(index.row()):
-            color = QColor(COLOR.new_row_tint)
-            color.setAlphaF(COLOR.new_row_alpha)
-            return color
+        if role == Qt.BackgroundRole:
+            # Duplicate tint wins over the "new" tint; both stay low-key.
+            if self.duplicate_reason(index.row()):
+                color = QColor(COLOR.duplicate_row_tint)
+                color.setAlphaF(COLOR.duplicate_row_alpha)
+                return color
+            if self.is_new(index.row()):
+                color = QColor(COLOR.new_row_tint)
+                color.setAlphaF(COLOR.new_row_alpha)
+                return color
         if role == Qt.ToolTipRole and index.column() in (ORDER_COLUMN, FILENAME_COLUMN):
             notes = []
             if index.column() == FILENAME_COLUMN:
@@ -120,6 +135,8 @@ class TrackTableModel(QAbstractTableModel):
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):  # noqa: N802
         if role == Qt.DisplayRole and orientation == Qt.Horizontal:
             return HEADERS[section] if 0 <= section < len(HEADERS) else None
+        if role == Qt.ToolTipRole and orientation == Qt.Horizontal:
+            return SORT_TOOLTIP if section in SORTABLE_COLUMNS else None
         return super().headerData(section, orientation, role)
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlags:
@@ -134,12 +151,90 @@ class TrackTableModel(QAbstractTableModel):
         self.endResetModel()
 
 
+class TrackHeaderView(QHeaderView):
+    """Header that marks every sortable column: muted ⇅ when inactive, bright
+    ▲/▼ when active. Qt's own sort arrow stays hidden."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(Qt.Horizontal, parent)
+        self.sort_column: int | None = None
+        self.sort_order: Qt.SortOrder | None = None
+        self.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.setSortIndicatorShown(False)
+        self.setMouseTracking(True)
+
+    def set_sort_state(self, column: int | None, order: Qt.SortOrder | None) -> None:
+        self.sort_column, self.sort_order = column, order
+        self.viewport().update()
+
+    def sort_glyph(self, section: int) -> str | None:
+        if section not in SORTABLE_COLUMNS:
+            return None
+        if section != self.sort_column or self.sort_order is None:
+            return SORT_GLYPH_INACTIVE
+        if self.sort_order == Qt.AscendingOrder:
+            return SORT_GLYPH_ASCENDING
+        return SORT_GLYPH_DESCENDING
+
+    def _glyph_font(self):
+        font = self.font()
+        font.setPointSizeF(font.pointSizeF() * FONT.sort_glyph_scale)
+        return font
+
+    def _glyph_space(self) -> int:
+        metrics = QFontMetrics(self._glyph_font())
+        widest = max(
+            metrics.horizontalAdvance(glyph)
+            for glyph in (SORT_GLYPH_INACTIVE, SORT_GLYPH_ASCENDING, SORT_GLYPH_DESCENDING)
+        )
+        return widest + SPACE.sm
+
+    def sectionSizeFromContents(self, logicalIndex: int):  # noqa: N802
+        size = super().sectionSizeFromContents(logicalIndex)
+        if logicalIndex in SORTABLE_COLUMNS:
+            size.setWidth(size.width() + self._glyph_space())
+        return size
+
+    def paintSection(self, painter, rect, logicalIndex: int) -> None:  # noqa: N802
+        painter.save()
+        super().paintSection(painter, rect, logicalIndex)
+        painter.restore()
+        glyph = self.sort_glyph(logicalIndex)
+        if glyph is None:
+            return
+        active = glyph != SORT_GLYPH_INACTIVE
+        painter.save()
+        painter.setFont(self._glyph_font())
+        painter.setPen(
+            QColor(COLOR.sort_glyph_active if active else COLOR.sort_glyph_inactive)
+        )
+        painter.drawText(
+            rect.adjusted(0, 0, -SPACE.sm, 0), int(Qt.AlignRight | Qt.AlignVCenter), glyph
+        )
+        painter.restore()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        super().mouseMoveEvent(event)
+        section = self.logicalIndexAt(event.position().toPoint())
+        if self.sectionsClickable() and section in SORTABLE_COLUMNS:
+            self.setCursor(Qt.PointingHandCursor)
+        else:
+            self.unsetCursor()
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self.unsetCursor()
+        super().leaveEvent(event)
+
+
 class TrackTableView(QTableView):
     rows_dropped = Signal(list, int)
     sort_requested = Signal(int)
+    remove_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.removal_enabled = True
+        self.setHorizontalHeader(TrackHeaderView(self))
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setDragEnabled(True)
@@ -198,6 +293,24 @@ class TrackTableView(QTableView):
         if event.type() in (QEvent.FontChange, QEvent.StyleChange):
             self._apply_row_metrics()
 
+    def _has_selection(self) -> bool:
+        return bool(self.selectionModel() and self.selectionModel().selectedRows())
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        menu = QMenu(self)
+        action = menu.addAction(REMOVE_ACTION_TEXT)
+        action.setEnabled(self.removal_enabled and self._has_selection())
+        action.triggered.connect(self.remove_requested.emit)
+        menu.exec(event.globalPos())
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        if event.key() == Qt.Key_Delete and event.modifiers() == Qt.NoModifier:
+            if self.removal_enabled and self._has_selection():
+                self.remove_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def startDrag(self, supported_actions: Qt.DropActions) -> None:  # noqa: N802
         rows = sorted({index.row() for index in self.selectionModel().selectedRows()})
         if not rows:
@@ -246,6 +359,7 @@ class TrackListWidget(QWidget):
     selection_changed = Signal()
     sort_requested = Signal(int)
     manual_order_changed = Signal()
+    remove_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -254,6 +368,7 @@ class TrackListWidget(QWidget):
         self.table.setModel(self.model)
         self.table.rows_dropped.connect(self._drop_rows)
         self.table.sort_requested.connect(self.sort_requested.emit)
+        self.table.remove_requested.connect(self.remove_requested.emit)
         self.table.selectionModel().selectionChanged.connect(
             lambda _selected, _deselected: self.selection_changed.emit()
         )
@@ -307,20 +422,35 @@ class TrackListWidget(QWidget):
     ) -> None:
         header = self.table.horizontalHeader()
         if column is None or direction is None:
-            header.setSortIndicatorShown(False)
+            header.set_sort_state(None, None)
             return
         order = (
             Qt.AscendingOrder
             if direction == SortDirection.ASCENDING
             else Qt.DescendingOrder
         )
-        header.setSortIndicator(column, order)
-        header.setSortIndicatorShown(True)
+        header.set_sort_state(column, order)
 
     def set_order_changes_enabled(self, enabled: bool) -> None:
         self.table.setDragEnabled(enabled)
         self.table.setAcceptDrops(enabled)
         self.table.horizontalHeader().setSectionsClickable(enabled)
+        self.table.removal_enabled = enabled
+
+    def selected_paths(self) -> list:
+        return [self.model.tracks[row].original_path for row in self.selected_rows()]
+
+    def remove_tracks(self, paths: Iterable) -> None:
+        """Drop rows in memory, keeping the order of the rest; # renumbers."""
+
+        removed = set(paths)
+        remaining = [t for t in self.model.tracks if t.original_path not in removed]
+        self.model.replace_tracks(remaining)
+        self.table.selectionModel().clearSelection()
+        if not remaining:
+            self.empty_label.setText(EMPTY_FOLDER_MESSAGE)
+            self.stack.setCurrentWidget(self.empty_label)
+        self.selection_changed.emit()
 
     def selected_rows(self) -> list[int]:
         return sorted(index.row() for index in self.table.selectionModel().selectedRows())

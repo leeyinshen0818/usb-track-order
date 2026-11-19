@@ -181,7 +181,7 @@ def test_duplicates_by_normalized_artist_title() -> None:
         fake("周杰倫 - 晴天.mp3"),
         fake("002 周杰伦-晴天.m4a"),
         fake("Unique.mp3"),
-        fake("Other (1).mp3"),
+        fake("Other (1).mp3"),  # copy suffix, but no "Other.mp3": not flagged
     ]
     flagged = find_possible_duplicates(tracks)
     assert {p.name for p in flagged} == {
@@ -189,7 +189,6 @@ def test_duplicates_by_normalized_artist_title() -> None:
         "jay chou – qing tian.flac",
         "周杰倫 - 晴天.mp3",
         "002 周杰伦-晴天.m4a",
-        "Other (1).mp3",
     }
 
 
@@ -224,8 +223,10 @@ def test_widget_shows_highlight_and_duplicate_marker() -> None:
     widget.set_flags({tracks[1].original_path}, {tracks[0].original_path: "copy"})
     model = widget.model
     assert model.data(model.index(0, 0)) == f"001 {DUPLICATE_MARKER}"
-    assert model.data(model.index(0, 1), Qt.BackgroundRole) is None
-    assert model.data(model.index(1, 1), Qt.BackgroundRole) is not None
+    duplicate_tint = model.data(model.index(0, 1), Qt.BackgroundRole)
+    new_tint = model.data(model.index(1, 1), Qt.BackgroundRole)
+    assert duplicate_tint is not None and new_tint is not None
+    assert duplicate_tint != new_tint
     assert "Possible duplicate" in model.data(model.index(0, 1), Qt.ToolTipRole)
 
 
